@@ -461,6 +461,57 @@ def _signal_wellness(joueur_id: UUID, cfg: dict, conn) -> tuple:
     return 0, None
 
 
+def _signal_srpe(joueur_id: UUID, cfg: dict, conn) -> tuple:
+    """
+    Signal sRPE — charge subjective (RPE × durée) saisie par le joueur.
+    ACWR sur la charge ressentie : aiguë (7 j) vs chronique hebdo (jours 8-28 / 3).
+    Complète la charge GPS (utile notamment pour les séances sans GPS, ex. techniques).
+    Renvoie (0, None) si données insuffisantes ou table absente.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    SUM(CASE WHEN date >= CURRENT_DATE - INTERVAL '7 days'
+                             THEN charge ELSE 0 END) AS aigue,
+                    SUM(CASE WHEN date >= CURRENT_DATE - INTERVAL '28 days'
+                             AND date  < CURRENT_DATE - INTERVAL '7 days'
+                             THEN charge ELSE 0 END) / 3.0 AS chronique_hebdo
+                FROM rpe_seance
+                WHERE joueur_id = %s
+                  AND date >= CURRENT_DATE - INTERVAL '28 days'
+                  AND charge IS NOT NULL
+            """, (str(joueur_id),))
+            row = cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0, None
+
+    if not row or row[1] is None or float(row[1]) == 0:
+        return 0, None
+
+    aigue     = float(row[0] or 0)
+    chronique = float(row[1])
+    if aigue <= 0:
+        return 0, None
+
+    ratio = aigue / chronique
+    pct   = round((ratio - 1) * 100)
+    seuil_prob = cfg.get("seuil_srpe_probable", 1.50)
+    seuil_poss = cfg.get("seuil_srpe_possible", 1.30)
+
+    if ratio >= seuil_prob:
+        return 25, (f"charge ressentie (sRPE) +{pct}% vs habituel"
+                    f" · type suggéré : surcharge subjective probable")
+    elif ratio >= seuil_poss:
+        return 12, (f"charge ressentie (sRPE) élevée +{pct}%"
+                    f" · type suggéré : surcharge subjective possible")
+    return 0, None
+
+
 def _bonus_blessure(joueur_id: UUID, cfg: dict, conn) -> tuple:
     """Bonus si blessure récente — fenêtre et score configurables."""
     fenetre = int(cfg.get("fenetre_blessure_fatigue_jours", 56))
@@ -576,16 +627,19 @@ def _calcul_fatigue(joueur_id: UUID, cfg: dict, conn) -> dict:
     # ── Signal wellness (ressenti subjectif) ──
     w_score, w_raison = _signal_wellness(joueur_id, cfg, conn)
 
+    # ── Signal sRPE (charge ressentie) ──
+    sr_score, sr_raison = _signal_srpe(joueur_id, cfg, conn)
+
     # ── Bonus blessure ──
     b_score, b_raison = _bonus_blessure(joueur_id, cfg, conn)
 
     # ── Bonus congestion ──
     c_score, c_raison = _bonus_congestion(joueur_id, cfg, conn)
 
-    score = min(s1_score + s2_score + s3_score + s4_score + w_score + b_score + c_score, 100.0)
+    score = min(s1_score + s2_score + s3_score + s4_score + w_score + sr_score + b_score + c_score, 100.0)
 
     # ── Message ──
-    parties = [r for r in [s1_raison, s2_raison, s3_raison, s4_raison, w_raison, b_raison, c_raison] if r]
+    parties = [r for r in [s1_raison, s2_raison, s3_raison, s4_raison, w_raison, sr_raison, b_raison, c_raison] if r]
     indicatifs = [s["msg"] for s in s2_details if s.get("msg")]
 
     if parties:
