@@ -408,6 +408,59 @@ def _calcul_signal4(joueur_id: UUID, cfg: dict, conn) -> tuple:
     return score, f"récupération insuffisante — {' · '.join(raisons[:3])} · type suggéré : {libelle}"
 
 
+def _signal_wellness(joueur_id: UUID, cfg: dict, conn) -> tuple:
+    """
+    Signal wellness — ressenti subjectif récent (indice de Hooper, saisie joueur).
+    Score de bien-être 0..100 (items négatifs inversés ; plus haut = mieux) calculé
+    sur la dernière saisie (≤ 3 jours). Un score bas augmente la fatigue.
+    Renvoie (0, None) si pas de saisie récente ou si la table n'existe pas encore.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT sommeil, fatigue, douleur, stress, humeur
+                FROM wellness_quotidien
+                WHERE joueur_id = %s
+                  AND date >= CURRENT_DATE - INTERVAL '3 days'
+                ORDER BY date DESC
+                LIMIT 1
+            """, (str(joueur_id),))
+            row = cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0, None
+
+    if not row:
+        return 0, None
+
+    sommeil, fatigue_i, douleur, stress, humeur = (int(v) for v in row)
+    # Composite identique au backend Java : 1..5 -> 0..100, items négatifs inversés.
+    composite = round((sommeil + humeur + (6 - fatigue_i) + (6 - douleur) + (6 - stress)) / 5 * 20)
+
+    # Items dégradés à signaler (haut = mauvais pour fatigue/douleur/stress ; bas = mauvais pour sommeil/humeur).
+    soucis = []
+    if fatigue_i >= 4: soucis.append("fatigue élevée")
+    if douleur >= 4:   soucis.append("courbatures")
+    if stress >= 4:    soucis.append("stress")
+    if sommeil <= 2:   soucis.append("sommeil dégradé")
+    if humeur <= 2:    soucis.append("humeur basse")
+    detail = (" — " + ", ".join(soucis)) if soucis else ""
+
+    seuil_alerte    = cfg.get("seuil_wellness_alerte",    40)
+    seuil_vigilance = cfg.get("seuil_wellness_vigilance", 55)
+
+    if composite < seuil_alerte:
+        return 25, (f"ressenti dégradé (bien-être {composite}/100{detail})"
+                    f" · type suggéré : fatigue subjective probable")
+    elif composite < seuil_vigilance:
+        return 12, (f"ressenti à surveiller (bien-être {composite}/100{detail})"
+                    f" · type suggéré : fatigue subjective possible")
+    return 0, None
+
+
 def _bonus_blessure(joueur_id: UUID, cfg: dict, conn) -> tuple:
     """Bonus si blessure récente — fenêtre et score configurables."""
     fenetre = int(cfg.get("fenetre_blessure_fatigue_jours", 56))
@@ -520,16 +573,19 @@ def _calcul_fatigue(joueur_id: UUID, cfg: dict, conn) -> dict:
     # ── Signal 4 ──
     s4_score, s4_raison = _calcul_signal4(joueur_id, cfg, conn)
 
+    # ── Signal wellness (ressenti subjectif) ──
+    w_score, w_raison = _signal_wellness(joueur_id, cfg, conn)
+
     # ── Bonus blessure ──
     b_score, b_raison = _bonus_blessure(joueur_id, cfg, conn)
 
     # ── Bonus congestion ──
     c_score, c_raison = _bonus_congestion(joueur_id, cfg, conn)
 
-    score = min(s1_score + s2_score + s3_score + s4_score + b_score + c_score, 100.0)
+    score = min(s1_score + s2_score + s3_score + s4_score + w_score + b_score + c_score, 100.0)
 
     # ── Message ──
-    parties = [r for r in [s1_raison, s2_raison, s3_raison, s4_raison, b_raison, c_raison] if r]
+    parties = [r for r in [s1_raison, s2_raison, s3_raison, s4_raison, w_raison, b_raison, c_raison] if r]
     indicatifs = [s["msg"] for s in s2_details if s.get("msg")]
 
     if parties:
