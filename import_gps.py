@@ -124,7 +124,10 @@ def est_ligne_joueur(row, colonne_nom):
             return False
     return True
 
-
+# ============================================================
+# FONCTIONS PRINCIPALES D'IMPORT
+# ============================================================
+# fonctions pour trouver ou créer les joueurs
 def trouver_ou_creer_joueur(conn, nom):
     """Cherche un joueur par nom, le crée s'il n'existe pas"""
     with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
@@ -154,7 +157,7 @@ def trouver_ou_creer_joueur(conn, nom):
 
         return cur.fetchone()["id"]
 
-
+# fonction pour trouver le type de séance
 def trouver_type_seance(conn, code_type):
     """Récupère l'UUID du type de séance"""
     with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
@@ -165,7 +168,7 @@ def trouver_type_seance(conn, code_type):
             sys.exit(1)
         return result["id"]
 
-
+# fonction pour créer la séance
 def creer_seance(conn, args, type_seance_id):
     """Crée la séance en base et retourne son UUID"""
     with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
@@ -204,7 +207,7 @@ def creer_seance(conn, args, type_seance_id):
         print(f"✓ Séance créée : {args.date} ({args.type})")
         return seance_id
 
-
+# fonction principale d'import des données GPS
 def importer_donnees_gps(conn, df, seance_id, colonne_nom):
     """Importe les données GPS de chaque joueur"""
     nb_importes = 0
@@ -309,7 +312,7 @@ def importer_donnees_gps(conn, df, seance_id, colonne_nom):
 
     return nb_importes, nb_erreurs, nb_ignores
 
-
+# fonction pour lire le fichier Excel
 def lire_excel(fichier):
     """Lit le fichier Excel et retourne les DataFrames par onglet"""
     try:
@@ -321,7 +324,7 @@ def lire_excel(fichier):
         print(f"✗ Erreur lecture Excel : {e}")
         sys.exit(1)
 
-
+# fonction pour trouver la colonne des noms de joueurs
 def trouver_colonne_nom(df):
     """Trouve automatiquement la colonne qui contient les noms des joueurs"""
     # La première colonne non-numérique contient les noms
@@ -338,6 +341,7 @@ def trouver_colonne_nom(df):
 # PROGRAMME PRINCIPAL
 # ============================================================
 
+# Le programme principal : parse les arguments, connecte à la DB, crée la séance, lit le fichier Excel, et importe les données GPS
 def main():
     parser = argparse.ArgumentParser(description="Import GPS Excel → PostgreSQL")
     parser.add_argument("--fichier",  required=True,  help="Chemin vers le fichier Excel")
