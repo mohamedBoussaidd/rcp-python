@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api.routes import predictions, health
+from app.api.routes import predictions, health
 
 app = FastAPI(title="Rémi C Préparateur - API IA", version="1.0.0")
 

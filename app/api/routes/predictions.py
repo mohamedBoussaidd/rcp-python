@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException
 from uuid import UUID
 from datetime import date as _date
-from api.database import get_connection
-from api.models.schemas import RisqueBlessure, NiveauFatigue, ResumeJoueur
+from app.core.database import get_connection
+from app.schemas.schemas import RisqueBlessure, NiveauFatigue, ResumeJoueur
 from typing import List
 
 router = APIRouter()
