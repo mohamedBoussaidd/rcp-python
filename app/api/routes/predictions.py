@@ -774,7 +774,9 @@ def get_rapport_seance(seance_id: UUID):
 
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT s.id, s.date, ts.code, ts.libelle, s.type_seance_id
+                    SELECT s.id, s.date, ts.code, ts.libelle, s.type_seance_id,
+                           s.objectif, s.objectif_distance_m, s.objectif_intensite,
+                           s.objectif_distance_haute_intensite_m
                     FROM seance s
                     JOIN type_seance ts ON ts.id = s.type_seance_id
                     WHERE s.id = %s
@@ -787,6 +789,25 @@ def get_rapport_seance(seance_id: UUID):
             type_seance_id = seance[4]
             type_code      = seance[2]
             seance_date    = seance[1]
+
+            # Objectif d'équipe saisi par le préparateur (Phase 1), tous types
+            objectif_texte             = seance[5]
+            objectif_distance_m        = int(seance[6]) if seance[6] is not None else None
+            objectif_intensite         = int(seance[7]) if seance[7] is not None else None
+            objectif_distance_hi_m     = int(seance[8]) if seance[8] is not None else None
+
+            # Durée de référence de la séance = somme des durées des exercices
+            # (override seance_exercice sinon valeur de l'exercice). Sert au prorata
+            # de l'objectif d'équipe par joueur selon son temps de jeu réel.
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT SUM(COALESCE(se.duree_minutes, e.duree_minutes))
+                    FROM seance_exercice se
+                    JOIN exercice e ON e.id = se.exercice_id
+                    WHERE se.seance_id = %s
+                """, (str(seance_id),))
+                ref_row = cur.fetchone()
+            duree_reference = float(ref_row[0]) if ref_row and ref_row[0] else None
 
             with conn.cursor() as cur:
                 cur.execute("""
@@ -843,6 +864,13 @@ def get_rapport_seance(seance_id: UUID):
                                  else "SUR_NORME" if delta_pct > sur_norme_pct
                                  else "DANS_NORME")
 
+                # Objectif séance (équipe) au prorata du temps joué — tous types
+                objectif_seance_m = atteint_objectif_seance = None
+                if objectif_distance_m and duree_reference and duree_reelle:
+                    objectif_seance_m = round(objectif_distance_m * (duree_reelle / duree_reference), 0)
+                    if dist_reelle is not None:
+                        atteint_objectif_seance = dist_reelle >= objectif_seance_m
+
                 objectif_m = ratio_objectif = ratio_objectif_original = None
                 correction_poids_pct = ecart_poids_kg = atteint_objectif = None
 
@@ -880,6 +908,8 @@ def get_rapport_seance(seance_id: UUID):
                     "correction_poids_pct":    correction_poids_pct,
                     "ecart_poids_kg":          ecart_poids_kg,
                     "atteint_objectif":        atteint_objectif,
+                    "objectif_seance_m":       objectif_seance_m,
+                    "atteint_objectif_seance": atteint_objectif_seance,
                 })
 
         return {
@@ -888,6 +918,12 @@ def get_rapport_seance(seance_id: UUID):
             "type_code":    type_code,
             "type_libelle": seance[3],
             "nb_joueurs":   len(lignes),
+            # Objectif d'équipe de la séance (cible prépa, tous types)
+            "objectif":                            objectif_texte,
+            "objectif_distance_m":                 objectif_distance_m,
+            "objectif_intensite":                  objectif_intensite,
+            "objectif_distance_haute_intensite_m": objectif_distance_hi_m,
+            "duree_reference_minutes":             int(duree_reference) if duree_reference else None,
             "lignes":       lignes,
         }
     except HTTPException:
