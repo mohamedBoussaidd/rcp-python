@@ -1,0 +1,21 @@
+# API IA FastAPI (INTERNE) — déployé dans /opt/applications/sportgestions/python/
+# Variables ${...} lues depuis le .env partagé (../.env) via --env-file dans le workflow.
+services:
+  python:
+    image: mohamedd69/sportgestions-python:latest
+    container_name: sportgestions-python
+    restart: always
+    environment:
+      DB_HOST: sportgestions-postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JAVA_API_URL: http://sportgestions-backend:8080
+    networks:
+      - sportgestions-network   # service interne, aucun port exposé
+
+networks:
+  sportgestions-network:
+    external: true
+    name: sportgestions-network
