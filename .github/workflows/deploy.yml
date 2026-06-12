@@ -8,6 +8,7 @@ on:
 env:
   IMAGE: mohamedd69/sportgestions-python
   APP_DIR: /opt/applications/sportgestions/python
+  PROJECT: sportgestions-python
 
 jobs:
   build-and-deploy:
@@ -56,6 +57,6 @@ jobs:
           port: 22
           script: |
             cd ${{ env.APP_DIR }}
-            docker-compose --env-file ../.env pull
-            docker-compose --env-file ../.env up -d
+            docker-compose -p ${{ env.PROJECT }} --env-file ../.env pull
+            docker-compose -p ${{ env.PROJECT }} --env-file ../.env up -d
             docker image prune -f
