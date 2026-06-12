@@ -58,5 +58,7 @@ jobs:
           script: |
             cd ${{ env.APP_DIR }}
             docker-compose -p ${{ env.PROJECT }} --env-file ../.env pull
+            # docker-compose v1 plante sur "recreate" (KeyError ContainerConfig) -> on recree a neuf
+            docker-compose -p ${{ env.PROJECT }} --env-file ../.env rm -sf || true
             docker-compose -p ${{ env.PROJECT }} --env-file ../.env up -d
             docker image prune -f
