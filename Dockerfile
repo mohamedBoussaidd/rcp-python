@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Code applicatif (module d'entrée : app.main:app)
 COPY app ./app
+COPY generate_saison ./generate_saison
 
 # Service INTERNE (jamais exposé sur internet), appelé par le backend Java
 EXPOSE 8000
