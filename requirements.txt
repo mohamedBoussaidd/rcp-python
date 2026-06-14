@@ -8,3 +8,4 @@ numpy>=1.26.4
 joblib>=1.4.0
 python-dotenv>=1.0.0
 pydantic>=2.7.0
+requests>=2.31.0
