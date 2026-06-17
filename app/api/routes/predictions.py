@@ -119,34 +119,44 @@ def _poids_a_date(joueur_id: UUID, date_ref, conn) -> tuple:
     return (None, None)
 
 
-def _calcul_score_risque(joueur_id: UUID, cfg: dict, conn) -> float:
+def _calcul_score_risque(joueur_id: UUID, cfg: dict, conn) -> dict:
     """
-    ACWR (Acute:Chronic Workload Ratio) avec fenêtres NON chevauchantes :
-      - Charge aiguë  = SUM distances 7 derniers jours
-      - Charge chronique hebdo = SUM distances jours 8-28 / 3 semaines
+    ACWR (Acute:Chronic Workload Ratio) « découplé » — fenêtres NON chevauchantes :
+      - Charge aiguë           = SUM distances 7 derniers jours
+      - Charge chronique hebdo = SUM distances jours 8-35 / 4 semaines
+    La semaine en cours est exclue de la base chronique (découplé, Windt & Gabbett 2019)
+    pour éviter le biais de couplage mathématique.
     ACWR élevé (>1.3) indique un risque de blessure.
     Bonus poids et blessures récentes configurables.
+
+    Renvoie un dict : score 0-100, acwr brut, charges aiguë/chronique hebdo (km).
+    Le nombre de semaines de base chronique est configurable (clé `acwr_semaines_chronique`,
+    défaut 4) pour les utilisateurs avancés.
     """
+    sem_chronique = int(cfg.get("acwr_semaines_chronique", 4))
+    jours_chronique = 7 + sem_chronique * 7   # 35 jours pour 4 semaines
+
     with conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT
                 SUM(CASE WHEN s.date >= CURRENT_DATE - INTERVAL '7 days'
                          THEN dg.distance_totale_m ELSE 0 END) AS charge_aigue,
-                SUM(CASE WHEN s.date >= CURRENT_DATE - INTERVAL '28 days'
+                SUM(CASE WHEN s.date >= CURRENT_DATE - INTERVAL '{jours_chronique} days'
                          AND s.date  < CURRENT_DATE - INTERVAL '7 days'
-                         THEN dg.distance_totale_m ELSE 0 END) / 3.0 AS charge_chronique_hebdo,
+                         THEN dg.distance_totale_m ELSE 0 END) / %s AS charge_chronique_hebdo,
                 COUNT(CASE WHEN b.date_blessure >= CURRENT_DATE - INTERVAL '90 days'
                            THEN 1 END) AS blessures_recentes
             FROM donnee_gps dg
             JOIN seance s ON dg.seance_id = s.id
             LEFT JOIN blessure b ON b.joueur_id = dg.joueur_id
             WHERE dg.joueur_id = %s
-              AND s.date >= CURRENT_DATE - INTERVAL '28 days'
-        """, (str(joueur_id),))
+              AND s.date >= CURRENT_DATE - INTERVAL '{jours_chronique} days'
+        """, (float(sem_chronique), str(joueur_id)))
         row = cur.fetchone()
 
     if not row or row[1] is None or float(row[1]) == 0:
-        return 20.0
+        return {"score": 20.0, "acwr": None,
+                "charge_aigue_km": None, "charge_chronique_km": None}
 
     charge_aigue      = float(row[0] or 0)
     charge_chronique  = float(row[1])
@@ -170,7 +180,12 @@ def _calcul_score_risque(joueur_id: UUID, cfg: dict, conn) -> float:
             plafond    = cfg.get("correction_surpoids_plafond_pts", 20.0)
             score += min(ecart_kg * pts_par_kg, plafond)
 
-    return min(round(score, 1), 100.0)
+    return {
+        "score":               min(round(score, 1), 100.0),
+        "acwr":                round(acwr, 2),
+        "charge_aigue_km":     round(charge_aigue / 1000, 1),
+        "charge_chronique_km": round(charge_chronique / 1000, 1),
+    }
 
 
 def _signal2_detail(joueur_id: UUID, types: tuple, label_groupe: str,
@@ -437,8 +452,9 @@ def _signal_wellness(joueur_id: UUID, cfg: dict, conn) -> tuple:
         return 0, None
 
     sommeil, fatigue_i, douleur, stress, humeur = (int(v) for v in row)
-    # Composite identique au backend Java : 1..5 -> 0..100, items négatifs inversés.
-    composite = round((sommeil + humeur + (6 - fatigue_i) + (6 - douleur) + (6 - stress)) / 5 * 20)
+    # Échelle de saisie : 1 = excellent → 5 = très mauvais pour TOUS les items.
+    # Composite bien-être 0..100 (plus haut = mieux) : on inverse les 5 items.
+    composite = round(((6 - sommeil) + (6 - humeur) + (6 - fatigue_i) + (6 - douleur) + (6 - stress)) / 5 * 20)
 
     # Items dégradés à signaler (haut = mauvais pour fatigue/douleur/stress ; bas = mauvais pour sommeil/humeur).
     soucis = []
@@ -656,6 +672,183 @@ def _calcul_fatigue(joueur_id: UUID, cfg: dict, conn) -> dict:
     return {"score": round(score, 1), "niveau": _niveau_fatigue(score), "raison": raison}
 
 
+def _readiness_joueur(joueur_id: UUID, conn) -> tuple:
+    """
+    Readiness = dernier composite de bien-être (indice de Hooper, saisie joueur),
+    0..100, plus haut = mieux. Fenêtre de 7 jours pour rester informatif sur le
+    dashboard. Renvoie (composite|None, date_iso|None).
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT sommeil, fatigue, douleur, stress, humeur, date
+                FROM wellness_quotidien
+                WHERE joueur_id = %s
+                  AND date >= CURRENT_DATE - INTERVAL '7 days'
+                ORDER BY date DESC
+                LIMIT 1
+            """, (str(joueur_id),))
+            row = cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None, None
+
+    if not row:
+        return None, None
+
+    sommeil, fatigue_i, douleur, stress, humeur = (int(v) for v in row[:5])
+    # Tous les items 1=excellent..5=très mauvais → inversés pour « plus haut = mieux ».
+    composite = round(((6 - sommeil) + (6 - humeur) + (6 - fatigue_i) + (6 - douleur) + (6 - stress)) / 5 * 20)
+    return composite, str(row[5])
+
+
+def _monotonie_joueur(joueur_id: UUID, cfg: dict, conn) -> float | None:
+    """
+    Indice de monotonie de Foster (8 semaines glissantes) — valeur brute.
+    Monotonie = moyenne(charges hebdo pondérées) / écart-type(charges hebdo).
+    Renvoie None si données insuffisantes. Isolé du scoring de fatigue.
+    """
+    today = _date.today()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ts.code, dg.distance_totale_m, s.date
+                FROM donnee_gps dg
+                JOIN seance s ON dg.seance_id = s.id
+                JOIN type_seance ts ON s.type_seance_id = ts.id
+                WHERE dg.joueur_id = %s
+                  AND s.date >= CURRENT_DATE - INTERVAL '56 days'
+                  AND dg.distance_totale_m > 0
+            """, (str(joueur_id),))
+            rows = cur.fetchall()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+    weekly_loads = [0.0] * 8
+    for code, dist, session_date in rows:
+        if hasattr(session_date, 'date'):
+            session_date = session_date.date()
+        days_ago = (today - session_date).days
+        if 0 <= days_ago < 56:
+            weekly_loads[days_ago // 7] += float(dist) * _poids_seance(code, cfg)
+
+    if sum(1 for w in weekly_loads if w > 500) < 5:
+        return None
+
+    mean_load = sum(weekly_loads) / 8
+    if mean_load < 1500:
+        return None
+
+    stdev_load = (sum((w - mean_load) ** 2 for w in weekly_loads) / 8) ** 0.5
+    if stdev_load <= 10:
+        return 99.0
+    return round(mean_load / stdev_load, 1)
+
+
+def _sprint_neuromusculaire(joueur_id: UUID, cfg: dict, conn) -> dict:
+    """
+    Marqueur neuromusculaire orienté (NON diagnostique).
+
+    Le marqueur FIABLE de fatigue nerveuse est la perte de CAPACITÉ à atteindre
+    la vitesse de pointe — pas le volume de sprint (qui dépend surtout du format
+    de séance). On raisonne donc en PIC sur une fenêtre, pas séance à séance :
+      - vmax : pic des 7 derniers jours vs pic de la baseline (~4 sem., j8-35).
+        → robuste : une journée « technique » à basse vitesse ne déclenche rien
+          tant que le joueur a touché sa pointe une fois dans la semaine.
+      - distance > 28 km/h / min : sert UNIQUEMENT de confirmation, jamais de
+        déclencheur seul (un faible volume = souvent pas de sprint au programme).
+
+    Déclenche seulement si la vmax de pointe baisse. La baisse du volume >28 km/h
+    ne fait que renforcer (POSSIBLE → PROBABLE). Sur séances MATCH / INTENSIF.
+    On ne localise PAS de muscle (le GPS ne le permet pas) : message d'orientation.
+    Renvoie {niveau: None|'POSSIBLE'|'PROBABLE', message: str|None}.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT s.date, dg.duree_minutes, dg.vitesse_max_kmh, dg.distance_sprint_28kmh_m
+                FROM donnee_gps dg
+                JOIN seance s ON dg.seance_id = s.id
+                JOIN type_seance ts ON s.type_seance_id = ts.id
+                WHERE dg.joueur_id = %s
+                  AND ts.code = ANY(%s)
+                  AND s.date >= CURRENT_DATE - INTERVAL '35 days'
+                  AND dg.distance_totale_m > 0
+                  AND dg.duree_minutes > 0
+                ORDER BY s.date DESC
+            """, (str(joueur_id), ['MATCH', 'MATCH_AMICAL', 'INTENSIF']))
+            rows = cur.fetchall()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"niveau": None, "message": None}
+
+    today = _date.today()
+
+    def jours_depuis(d):
+        if hasattr(d, 'date'):
+            d = d.date()
+        return (today - d).days
+
+    recent   = [r for r in rows if jours_depuis(r[0]) < 7]
+    baseline = [r for r in rows if 7 <= jours_depuis(r[0]) <= 35]
+
+    # Au moins 2 séances HI récentes (pic récent fiable) et 2 en baseline,
+    # sinon le pic récent (1 séance) serait trop bruité pour conclure.
+    if len(recent) < 2 or len(baseline) < 2:
+        return {"niveau": None, "message": None}
+
+    # ── Gate principal : pic de vitesse de pointe (capacité) ──
+    vmax_r = [float(r[2]) for r in recent if r[2] is not None]
+    vmax_b = [float(r[2]) for r in baseline if r[2] is not None]
+    if len(vmax_r) < 2 or len(vmax_b) < 2:
+        return {"niveau": None, "message": None}
+
+    pic_r, pic_b = max(vmax_r), max(vmax_b)
+    if pic_b <= 0:
+        return {"niveau": None, "message": None}
+
+    ratio_vmax = pic_r / pic_b
+    # Seuil POSSIBLE à 7 % : absorbe le bruit GPS et le biais d'échantillonnage
+    # (la baseline a plus de séances → pic mécaniquement un peu plus haut).
+    seuil_poss = cfg.get("seuil_vmax_capacite_possible", 0.93)
+    seuil_prob = cfg.get("seuil_vmax_capacite_probable", 0.90)
+
+    # Capacité intacte (le joueur a touché sa pointe récemment) → aucun signal.
+    if ratio_vmax > seuil_poss:
+        return {"niveau": None, "message": None}
+
+    pct_vmax = round((1 - ratio_vmax) * 100)
+
+    # ── Confirmation (volume > 28 km/h par minute) ──
+    def d28_par_min(rs):
+        dur = sum(float(r[1]) for r in rs)
+        d28 = sum(float(r[3]) for r in rs if r[3] is not None)
+        return (d28 / dur) if dur > 0 else None
+
+    pr, pb = d28_par_min(recent), d28_par_min(baseline)
+    seuil_corrob = cfg.get("seuil_sprint_corroboration", 0.80)
+    volume_baisse = pr is not None and pb and pb > 0 and (pr / pb) <= seuil_corrob
+    pct_d28 = round((1 - pr / pb) * 100) if (pr is not None and pb and pb > 0) else None
+
+    niveau = "PROBABLE" if (ratio_vmax <= seuil_prob and volume_baisse) else "POSSIBLE"
+
+    message = (f"possibilité de fatigue neuromusculaire : baisse de {pct_vmax}% "
+               f"de sa vitesse de pointe sur ses séances à haute intensité (vs 4 sem.)")
+    if volume_baisse:
+        message += f", confirmée par −{pct_d28}% de courses à plus de 28 km/h"
+    return {"niveau": niveau, "message": message}
+
+
 def _niveau_risque(score: float) -> str:
     if score < 30:
         return "FAIBLE"
@@ -686,8 +879,9 @@ def get_risque_blessure(joueur_id: UUID):
             if not joueur:
                 raise HTTPException(status_code=404, detail="Joueur introuvable")
 
-            cfg   = _load_config(conn)
-            score = _calcul_score_risque(joueur_id, cfg, conn)
+            cfg     = _load_config(conn)
+            risque  = _calcul_score_risque(joueur_id, cfg, conn)
+            score   = risque["score"]
 
         return RisqueBlessure(
             joueur_id=joueur_id,
@@ -734,34 +928,39 @@ def get_fatigue(joueur_id: UUID):
 
 
 @router.get("/charge-collective")
-def get_charge_collective():
+def get_charge_collective(semaines: int = 4):
+    """
+    Charge collective (km) par semaine glissante sur les `semaines` dernières
+    semaines (4, 8 ou 12). Index 0 = la plus ancienne, dernier = semaine en cours.
+    """
+    semaines = semaines if semaines in (4, 8, 12) else 4
+    jours = semaines * 7
     try:
         with get_connection() as conn:
             with conn.cursor() as cur:
+                # bucket : 0 = semaine la plus ancienne … (semaines-1) = semaine en cours
                 cur.execute("""
                     SELECT
-                        CASE
-                            WHEN s.date >= CURRENT_DATE - INTERVAL '7 days'  THEN 3
-                            WHEN s.date >= CURRENT_DATE - INTERVAL '14 days' THEN 2
-                            WHEN s.date >= CURRENT_DATE - INTERVAL '21 days' THEN 1
-                            ELSE 0
-                        END AS semaine_idx,
+                        %s - 1 - FLOOR((CURRENT_DATE - s.date) / 7)::int AS semaine_idx,
                         ROUND(SUM(dg.distance_totale_m) / 1000.0, 1) AS total_km
                     FROM donnee_gps dg
                     JOIN seance s ON dg.seance_id = s.id
                     JOIN joueur j ON j.id = dg.joueur_id
-                    WHERE s.date >= CURRENT_DATE - INTERVAL '28 days'
+                    WHERE s.date >= CURRENT_DATE - (%s || ' days')::interval
                       AND j.statut != 'inactif'
                     GROUP BY 1
                     ORDER BY 1
-                """)
+                """, (semaines, jours))
                 rows = cur.fetchall()
 
-        data = [0.0, 0.0, 0.0, 0.0]
+        data = [0.0] * semaines
         for row in rows:
-            data[int(row[0])] = float(row[1])
+            idx = int(row[0])
+            if 0 <= idx < semaines:
+                data[idx] = float(row[1])
 
-        return {"labels": ["S-4", "S-3", "S-2", "S-1"], "data": data}
+        labels = [f"S-{semaines - i}" for i in range(semaines)]
+        return {"labels": labels, "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -932,6 +1131,170 @@ def get_rapport_seance(seance_id: UUID):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/equipe/charge")
+def get_charge_equipe(debut: str | None = None, fin: str | None = None, types: str | None = None):
+    """
+    Charge externe agrégée de l'équipe sur une période.
+    Renvoie deux vues :
+      - seances : une ligne par séance de la période (totaux d'équipe + distance attendue) ;
+      - joueurs : totaux par joueur + classement (tri par distance décroissante).
+    La distance attendue réutilise la baseline du rapport par séance (ratio moyen des
+    10 dernières séances de même type du joueur).
+    """
+    sous_seuil = sur_seuil = None
+    type_codes = [t.strip().upper() for t in types.split(",")] if types else None
+    try:
+        with get_connection() as conn:
+            cfg = _load_config(conn)
+            sous_seuil = cfg.get("seuil_sous_norme_pct", 20.0)
+            sur_seuil  = cfg.get("seuil_sur_norme_pct",  20.0)
+
+            # Historique des ratios par (joueur, type), du plus récent au plus ancien.
+            # Baseline d'une séance = moyenne des 10 plus récentes du même type, HORS séance
+            # courante (même logique que le rapport par séance, sans correction météo).
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT dg.joueur_id, s.type_seance_id, dg.seance_id,
+                           dg.distance_totale_m / NULLIF(dg.duree_minutes, 0) AS ratio
+                    FROM donnee_gps dg
+                    JOIN seance s ON s.id = dg.seance_id
+                    WHERE dg.duree_minutes > 0 AND dg.distance_totale_m > 0
+                    ORDER BY dg.joueur_id, s.type_seance_id, s.date DESC
+                """)
+                hist: dict = {}
+                for jid_, tid_, sid_, ratio_ in cur.fetchall():
+                    if ratio_ is None:
+                        continue
+                    hist.setdefault((str(jid_), str(tid_)), []).append((str(sid_), float(ratio_)))
+
+            # Lignes GPS de la période (filtre type optionnel).
+            params: list = []
+            where = ["j.statut != 'inactif'"]
+            if debut:
+                where.append("s.date >= %s"); params.append(debut)
+            if fin:
+                where.append("s.date <= %s"); params.append(fin)
+            if type_codes:
+                where.append("ts.code = ANY(%s)"); params.append(type_codes)
+
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT s.id, s.date, ts.code, ts.libelle, s.type_seance_id,
+                           j.id, j.nom, j.prenom, j.poste_principal,
+                           dg.distance_totale_m, dg.duree_minutes,
+                           dg.distance_19kmh_m, dg.distance_sprint_28kmh_m,
+                           dg.nb_sprints_24kmh, dg.vitesse_max_kmh,
+                           dg.nb_accelerations, dg.nb_freinages
+                    FROM donnee_gps dg
+                    JOIN seance s ON s.id = dg.seance_id
+                    JOIN type_seance ts ON ts.id = s.type_seance_id
+                    JOIN joueur j ON j.id = dg.joueur_id
+                    WHERE {' AND '.join(where)}
+                    ORDER BY s.date, j.nom, j.prenom
+                """, params)
+                rows = cur.fetchall()
+
+        def _statut(dist, att):
+            if dist is None or not att or att <= 0:
+                return "SANS_BASELINE"
+            pct = (dist - att) / att * 100
+            return "SOUS_NORME" if pct < -sous_seuil else "SUR_NORME" if pct > sur_seuil else "DANS_NORME"
+
+        def _baseline(jid: str, tid: str, sid: str):
+            lst = [r for (s, r) in hist.get((jid, tid), []) if s != sid][:10]
+            return sum(lst) / len(lst) if lst else None
+
+        def _f(v):  return float(v) if v is not None else None
+        def _i(v):  return int(v)   if v is not None else None
+
+        seances: dict = {}
+        joueurs: dict = {}
+
+        for r in rows:
+            (sid, sdate, tcode, tlib, type_seance_id,
+             jid, nom, prenom, poste,
+             dist, duree, d19, d28, sprints, vmax, accel, frein) = r
+            sid, jid, type_seance_id = str(sid), str(jid), str(type_seance_id)
+            dist  = _f(dist); duree = _f(duree)
+            ratio = _baseline(jid, type_seance_id, sid)
+            att   = round(ratio * duree, 0) if ratio and duree else None
+
+            s = seances.get(sid)
+            if s is None:
+                s = seances[sid] = {
+                    "seance_id": sid, "date": str(sdate), "type_code": tcode, "type_libelle": tlib,
+                    "nb_joueurs": 0, "distance_totale_m": 0.0, "distance_attendue_m": 0.0,
+                    "duree_minutes": 0.0, "distance_19kmh_m": 0.0, "distance_28kmh_m": 0.0,
+                    "nb_sprints": 0, "nb_accelerations": 0, "nb_freinages": 0,
+                    "vitesse_max": None, "_att_count": 0,
+                }
+            s["nb_joueurs"]        += 1
+            s["distance_totale_m"] += dist or 0.0
+            s["duree_minutes"]     += duree or 0.0
+            s["distance_19kmh_m"]  += _f(d19) or 0.0
+            s["distance_28kmh_m"]  += _f(d28) or 0.0
+            s["nb_sprints"]        += _i(sprints) or 0
+            s["nb_accelerations"]  += _i(accel) or 0
+            s["nb_freinages"]      += _i(frein) or 0
+            if att is not None:
+                s["distance_attendue_m"] += att
+                s["_att_count"]          += 1
+            if vmax is not None:
+                s["vitesse_max"] = max(s["vitesse_max"] or 0.0, _f(vmax))
+
+            j = joueurs.get(jid)
+            if j is None:
+                j = joueurs[jid] = {
+                    "joueur_id": jid, "nom": nom, "prenom": prenom, "poste": poste or "",
+                    "nb_seances": 0, "distance_totale_m": 0.0, "distance_attendue_m": 0.0,
+                    "duree_minutes": 0.0, "distance_19kmh_m": 0.0, "distance_28kmh_m": 0.0,
+                    "nb_sprints": 0, "vitesse_max": None, "_att_count": 0,
+                }
+            j["nb_seances"]        += 1
+            j["distance_totale_m"] += dist or 0.0
+            j["duree_minutes"]     += duree or 0.0
+            j["distance_19kmh_m"]  += _f(d19) or 0.0
+            j["distance_28kmh_m"]  += _f(d28) or 0.0
+            j["nb_sprints"]        += _i(sprints) or 0
+            if att is not None:
+                j["distance_attendue_m"] += att
+                j["_att_count"]          += 1
+            if vmax is not None:
+                j["vitesse_max"] = max(j["vitesse_max"] or 0.0, _f(vmax))
+
+        def _finalise(d: dict, par_joueur: bool) -> dict:
+            att        = round(d["distance_attendue_m"], 0) if d["_att_count"] else None
+            duree_sum  = d["duree_minutes"]
+            nb         = d["nb_joueurs"] if not par_joueur else 1
+            d["distance_totale_m"]   = round(d["distance_totale_m"], 0)
+            d["distance_attendue_m"] = att
+            d["distance_19kmh_m"]    = round(d["distance_19kmh_m"], 0)
+            d["distance_28kmh_m"]    = round(d["distance_28kmh_m"], 0)
+            # Intensité = distance d'équipe / minutes-joueur cumulées (m/min).
+            d["ratio_reel"]          = round(d["distance_totale_m"] / duree_sum, 0) if duree_sum else None
+            # Durée affichée : total (par joueur) ou moyenne par joueur (par séance).
+            d["duree_minutes"]       = round(duree_sum / nb, 0) if nb else round(duree_sum, 0)
+            d["statut"]              = _statut(d["distance_totale_m"], att)
+            d["delta_pct"]           = round((d["distance_totale_m"] - att) / att * 100, 1) if att else None
+            if d["vitesse_max"] is not None:
+                d["vitesse_max"] = round(d["vitesse_max"], 1)
+            d.pop("_att_count", None)
+            return d
+
+        seances_out = [_finalise(s, False) for s in seances.values()]
+        seances_out.sort(key=lambda s: s["date"])
+        joueurs_out = [_finalise(j, True) for j in joueurs.values()]
+        joueurs_out.sort(key=lambda j: j["distance_totale_m"], reverse=True)
+        for i, j in enumerate(joueurs_out):
+            j["rang"] = i + 1
+
+        return {"seances": seances_out, "joueurs": joueurs_out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/equipe", response_model=List[ResumeJoueur])
 def get_resume_equipe():
     try:
@@ -950,8 +1313,11 @@ def get_resume_equipe():
             resultats = []
             for j in joueurs:
                 joueur_id    = UUID(str(j[0]))
-                score_risque = _calcul_score_risque(joueur_id, cfg, conn)
+                risque       = _calcul_score_risque(joueur_id, cfg, conn)
+                score_risque = risque["score"]
                 fatigue      = _calcul_fatigue(joueur_id, cfg, conn)
+                readiness, readiness_date = _readiness_joueur(joueur_id, conn)
+                sprint = _sprint_neuromusculaire(joueur_id, cfg, conn)
                 resultats.append(ResumeJoueur(
                     joueur_id=joueur_id,
                     nom=j[1],
@@ -961,6 +1327,14 @@ def get_resume_equipe():
                     score_fatigue=fatigue["score"],
                     niveau_risque=_niveau_risque(score_risque),
                     niveau_fatigue=fatigue["niveau"],
+                    acwr=risque["acwr"],
+                    charge_aigue_km=risque["charge_aigue_km"],
+                    charge_chronique_km=risque["charge_chronique_km"],
+                    readiness=readiness,
+                    readiness_date=readiness_date,
+                    monotonie=_monotonie_joueur(joueur_id, cfg, conn),
+                    sprint_niveau=sprint["niveau"],
+                    sprint_message=sprint["message"],
                 ))
 
         return resultats
