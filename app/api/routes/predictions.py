@@ -1,8 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from uuid import UUID
 from datetime import date as _date
 from app.core.database import get_connection
-from app.schemas.schemas import RisqueBlessure, NiveauFatigue, ResumeJoueur
+from app.schemas.schemas import RisqueBlessure, NiveauFatigue, ResumeJoueur, ChargeCible
 from typing import List
 
 router = APIRouter()
@@ -81,6 +81,174 @@ def _load_config(conn) -> dict:
         return {}
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Contexte temporel CENTRALISÉ (saison / période / fraîcheur / blessure)
+#
+# Source UNIQUE de la règle « pas de données récentes ou hors-saison → pas
+# d'alerte ». Tous les indicateurs s'appuient dessus au lieu de refaire chacun
+# leur propre fenêtre temporelle. Tolérant aux migrations non passées (mode
+# legacy : si les tables saison/effectif n'existent pas, periode_type reste None
+# et seul le garde-fou de fraîcheur s'applique).
+# ════════════════════════════════════════════════════════════════════════════
+
+# Types de période où l'on N'ALERTE PAS (le joueur n'est pas censé être en charge).
+_PERIODES_SILENCE = ("TREVE", "INTERSAISON")
+# Types de période sans baseline stable → ACWR non alarmant (montée de charge attendue).
+_PERIODES_NEUTRALISER_ACWR = ("PREPARATION", "REPRISE")
+
+
+def _parse_date_simulee(valeur: str | None):
+    """Parse l'en-tête X-Date-Simulee (yyyy-MM-dd) en date, ou None si absent/invalide.
+    Outil de TEST : permet de se placer à une date arbitraire (préparation, trêve…)."""
+    if not valeur:
+        return None
+    try:
+        return _date.fromisoformat(valeur.strip()[:10])
+    except Exception:
+        return None
+
+
+def _jours_depuis_derniere_donnee(joueur_id: UUID, conn, date_ref=None) -> int | None:
+    """Jours écoulés depuis la dernière donnée (séance GPS ou RPE). None = jamais."""
+    ref = date_ref or _date.today()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT MAX(d) FROM (
+                    SELECT MAX(s.date) AS d
+                      FROM donnee_gps dg JOIN seance s ON dg.seance_id = s.id
+                      WHERE dg.joueur_id = %s AND dg.distance_totale_m > 0
+                    UNION ALL
+                    SELECT MAX(date) AS d
+                      FROM rpe_seance WHERE joueur_id = %s AND charge IS NOT NULL
+                ) t
+            """, (str(joueur_id), str(joueur_id)))
+            row = cur.fetchone()
+    except Exception:
+        try: conn.rollback()
+        except Exception: pass
+        return None
+    if not row or row[0] is None:
+        return None
+    return (ref - row[0]).days
+
+
+def _blessure_active(joueur_id: UUID, conn, date_ref=None) -> tuple:
+    """(blessure_active: bool, jours_restants: int|None) — blessure non RETABLI la plus récente.
+    jours_restants < 0 = date de retour prévue dépassée. Tolérant à l'absence de table."""
+    ref = date_ref or _date.today()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT date_retour_prevue FROM blessure
+                WHERE joueur_id = %s AND statut != 'RETABLI'
+                ORDER BY date_blessure DESC LIMIT 1
+            """, (str(joueur_id),))
+            row = cur.fetchone()
+    except Exception:
+        try: conn.rollback()
+        except Exception: pass
+        return (False, None)
+    if not row:
+        return (False, None)
+    drp = row[0]
+    return (True, (drp - ref).days if drp else None)
+
+
+def _contexte_joueur(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> dict:
+    """
+    Contexte temporel d'un joueur : saison EN_COURS de son équipe, période courante,
+    fraîcheur des données, blessure active → un ÉTAT exploitable par tous les calculs.
+    `date_ref` (date simulée) permet de se placer à une autre date pour tester la
+    temporalité (préparation, trêve…) ; défaut = aujourd'hui.
+
+    États :
+      EN_CHARGE   : suivi actif, alertes pleines
+      REPRISE     : reprise post-trêve, ACWR neutralisé (baseline en reconstruction)
+      INACTIF     : aucune donnée récente (> seuil) → indicateurs N/A, pas d'alerte
+      HORS_CHARGE : trêve / intersaison → pas d'alerte
+      HORS_SAISON : l'équipe utilise les saisons mais aucune n'est en cours → pas d'alerte
+      BLESSE      : blessure active → pas d'alerte de charge (le joueur ne s'entraîne pas)
+    """
+    ref = date_ref or _date.today()
+    saison_debut = None
+    periode_type = None
+    periode_libelle = None
+    hors_saison = False
+
+    try:
+        with conn.cursor() as cur:
+            # Saison au niveau CLUB (V37) : on remonte le club via l'équipe du joueur.
+            # Saison EN_COURS du club (le cas échéant) + le club a-t-il des saisons ?
+            cur.execute("""
+                SELECT
+                  j.equipe_id AS equipe_id,
+                  (SELECT s.date_debut FROM saison s
+                     JOIN equipe e ON e.club_id = s.club_id
+                     WHERE e.id = j.equipe_id AND s.statut = 'EN_COURS'
+                     ORDER BY s.date_debut DESC LIMIT 1) AS encours_debut,
+                  (SELECT s.id FROM saison s
+                     JOIN equipe e ON e.club_id = s.club_id
+                     WHERE e.id = j.equipe_id AND s.statut = 'EN_COURS'
+                     ORDER BY s.date_debut DESC LIMIT 1) AS encours_id,
+                  EXISTS (SELECT 1 FROM saison s
+                     JOIN equipe e ON e.club_id = s.club_id
+                     WHERE e.id = j.equipe_id) AS a_saisons
+                FROM joueur j WHERE j.id = %s
+            """, (str(joueur_id),))
+            row = cur.fetchone()
+        if row:
+            equipe_id, encours_debut, encours_id, a_saisons = row[0], row[1], row[2], row[3]
+            if encours_id is not None:                    # une saison EN_COURS existe
+                saison_debut = encours_debut
+                with conn.cursor() as cur:
+                    # Période courante de CETTE équipe dans la saison (clé saison_id + equipe_id).
+                    cur.execute("""
+                        SELECT type, libelle FROM periode_saison
+                        WHERE saison_id = %s AND equipe_id = %s
+                          AND %s::date BETWEEN date_debut AND date_fin
+                        ORDER BY date_debut DESC LIMIT 1
+                    """, (str(encours_id), str(equipe_id), ref))
+                    pr = cur.fetchone()
+                if pr:
+                    periode_type, periode_libelle = pr[0], pr[1]
+            elif bool(a_saisons):                         # des saisons existent mais aucune EN_COURS
+                hors_saison = True
+    except Exception:
+        try: conn.rollback()
+        except Exception: pass   # tables saison absentes → mode legacy
+
+    jours_inactif = _jours_depuis_derniere_donnee(joueur_id, conn, ref)
+    blessure_active, jours_restants = _blessure_active(joueur_id, conn, ref)
+    seuil_inactif = int(cfg.get("jours_inactif_max", 10))
+
+    if hors_saison:
+        etat = "HORS_SAISON"
+    elif periode_type in _PERIODES_SILENCE:
+        etat = "HORS_CHARGE"
+    elif blessure_active:
+        etat = "BLESSE"
+    elif jours_inactif is None or jours_inactif > seuil_inactif:
+        etat = "INACTIF"
+    elif periode_type in _PERIODES_NEUTRALISER_ACWR:
+        etat = "REPRISE" if periode_type == "REPRISE" else "EN_CHARGE"
+    else:
+        etat = "EN_CHARGE"
+
+    return {
+        "etat": etat,
+        "saison_debut": saison_debut,
+        "periode_type": periode_type,
+        "periode_libelle": periode_libelle,
+        "jours_inactif": jours_inactif,
+        "blessure_active": blessure_active,
+        "blessure_jours_restants": jours_restants,
+        # drapeaux dérivés (pratiques pour les appelants)
+        "silence": etat in ("HORS_CHARGE", "HORS_SAISON", "INACTIF", "BLESSE"),
+        "neutraliser_acwr": periode_type in _PERIODES_NEUTRALISER_ACWR,
+    }
+
+
 def _poids_seance(type_code: str, cfg: dict) -> float:
     key = POIDS_TYPE_KEY.get(type_code, "")
     return cfg.get(key, 0.60) if key else 0.60
@@ -119,72 +287,264 @@ def _poids_a_date(joueur_id: UUID, date_ref, conn) -> tuple:
     return (None, None)
 
 
-def _calcul_score_risque(joueur_id: UUID, cfg: dict, conn) -> dict:
+def _charge_gps(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> tuple | None:
     """
-    ACWR (Acute:Chronic Workload Ratio) « découplé » — fenêtres NON chevauchantes :
-      - Charge aiguë           = SUM distances 7 derniers jours
-      - Charge chronique hebdo = SUM distances jours 8-35 / 4 semaines
-    La semaine en cours est exclue de la base chronique (découplé, Windt & Gabbett 2019)
-    pour éviter le biais de couplage mathématique.
-    ACWR élevé (>1.3) indique un risque de blessure.
-    Bonus poids et blessures récentes configurables.
-
-    Renvoie un dict : score 0-100, acwr brut, charges aiguë/chronique hebdo (km).
-    Le nombre de semaines de base chronique est configurable (clé `acwr_semaines_chronique`,
-    défaut 4) pour les utilisateurs avancés.
+    Charge externe (GPS) « découplée » — fenêtres NON chevauchantes :
+      - aiguë           = SUM distances 7 derniers jours (mètres)
+      - chronique hebdo = SUM distances jours 8-35 / 4 semaines (mètres)
+    `date_ref` permet de calculer à une date passée (tendance). Défaut = aujourd'hui.
+    Renvoie (aigue_m, chronique_hebdo_m) ou None si pas de base chronique.
     """
+    ref = date_ref or _date.today()
     sem_chronique = int(cfg.get("acwr_semaines_chronique", 4))
     jours_chronique = 7 + sem_chronique * 7   # 35 jours pour 4 semaines
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT
-                SUM(CASE WHEN s.date >= CURRENT_DATE - INTERVAL '7 days'
-                         THEN dg.distance_totale_m ELSE 0 END) AS charge_aigue,
-                SUM(CASE WHEN s.date >= CURRENT_DATE - INTERVAL '{jours_chronique} days'
-                         AND s.date  < CURRENT_DATE - INTERVAL '7 days'
-                         THEN dg.distance_totale_m ELSE 0 END) / %s AS charge_chronique_hebdo,
-                COUNT(CASE WHEN b.date_blessure >= CURRENT_DATE - INTERVAL '90 days'
-                           THEN 1 END) AS blessures_recentes
-            FROM donnee_gps dg
-            JOIN seance s ON dg.seance_id = s.id
-            LEFT JOIN blessure b ON b.joueur_id = dg.joueur_id
-            WHERE dg.joueur_id = %s
-              AND s.date >= CURRENT_DATE - INTERVAL '{jours_chronique} days'
-        """, (float(sem_chronique), str(joueur_id)))
-        row = cur.fetchone()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    SUM(CASE WHEN s.date >= %s::date - INTERVAL '7 days'
+                             THEN dg.distance_totale_m ELSE 0 END) AS charge_aigue,
+                    SUM(CASE WHEN s.date >= %s::date - INTERVAL '{jours_chronique} days'
+                             AND s.date  < %s::date - INTERVAL '7 days'
+                             THEN dg.distance_totale_m ELSE 0 END) / %s AS charge_chronique_hebdo
+                FROM donnee_gps dg
+                JOIN seance s ON dg.seance_id = s.id
+                WHERE dg.joueur_id = %s
+                  AND s.date >= %s::date - INTERVAL '{jours_chronique} days'
+                  AND s.date <= %s::date
+            """, (ref, ref, ref, float(sem_chronique), str(joueur_id), ref, ref))
+            row = cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
 
     if not row or row[1] is None or float(row[1]) == 0:
+        return None
+    return (float(row[0] or 0), float(row[1]))
+
+
+def _charge_rpe(joueur_id: UUID, conn, date_ref=None) -> tuple | None:
+    """
+    Charge interne (sRPE = RPE × durée, saisie joueur) « découplée » :
+      - aiguë           = SUM charges 7 derniers jours
+      - chronique hebdo = SUM charges jours 8-28 / 3 semaines
+    Sert de source de repli quand le GPS manque (séances techniques, sans gilets).
+    Renvoie (aigue, chronique_hebdo) ou None si pas de base chronique / table absente.
+    """
+    ref = date_ref or _date.today()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    SUM(CASE WHEN date >= %s::date - INTERVAL '7 days'
+                             THEN charge ELSE 0 END) AS aigue,
+                    SUM(CASE WHEN date >= %s::date - INTERVAL '28 days'
+                             AND date  < %s::date - INTERVAL '7 days'
+                             THEN charge ELSE 0 END) / 3.0 AS chronique_hebdo
+                FROM rpe_seance
+                WHERE joueur_id = %s
+                  AND date >= %s::date - INTERVAL '28 days'
+                  AND date <= %s::date
+                  AND charge IS NOT NULL
+            """, (ref, ref, ref, str(joueur_id), ref, ref))
+            row = cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+    if not row or row[1] is None or float(row[1]) == 0:
+        return None
+    return (float(row[0] or 0), float(row[1]))
+
+
+def _charge_acwr_unifiee(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> dict:
+    """
+    Source de charge UNIFIÉE avec repli (fallback) :
+      - GPS présent seul          → ACWR sur les km (charge externe)
+      - RPE présent seul           → ACWR sur la charge ressentie (repli)
+      - les deux présents          → ACWR combiné pondéré (MIXTE)
+      - aucune donnée              → source None
+
+    GPS (externe) et RPE (interne) ne mesurent pas la même chose : on les combine
+    via leurs ratios ACWR (sans dimension), pondérés (clés cfg `poids_charge_gps`
+    / `poids_charge_rpe`). Les charges aiguë/chronique renvoyées sont en km si le
+    GPS est disponible (source GPS ou MIXTE), sinon en unités sRPE.
+
+    Renvoie : {source, acwr, aigue, chronique, unite, acwr_gps, acwr_rpe}.
+    """
+    gps = _charge_gps(joueur_id, cfg, conn, date_ref)
+    rpe = _charge_rpe(joueur_id, conn, date_ref)
+
+    acwr_gps = (gps[0] / gps[1]) if gps and gps[1] > 0 else None
+    acwr_rpe = (rpe[0] / rpe[1]) if rpe and rpe[1] > 0 else None
+
+    vide = {"source": None, "acwr": None, "aigue": None, "chronique": None,
+            "unite": None, "acwr_gps": None, "acwr_rpe": None}
+
+    if acwr_gps is not None and acwr_rpe is not None:
+        w_g = float(cfg.get("poids_charge_gps", 0.6))
+        w_r = float(cfg.get("poids_charge_rpe", 0.4))
+        acwr = (w_g * acwr_gps + w_r * acwr_rpe) / (w_g + w_r)
+        return {"source": "MIXTE", "acwr": round(acwr, 2),
+                "aigue": round(gps[0] / 1000, 1), "chronique": round(gps[1] / 1000, 1),
+                "unite": "km", "acwr_gps": round(acwr_gps, 2), "acwr_rpe": round(acwr_rpe, 2)}
+    if acwr_gps is not None:
+        return {"source": "GPS", "acwr": round(acwr_gps, 2),
+                "aigue": round(gps[0] / 1000, 1), "chronique": round(gps[1] / 1000, 1),
+                "unite": "km", "acwr_gps": round(acwr_gps, 2), "acwr_rpe": None}
+    if acwr_rpe is not None:
+        return {"source": "RPE", "acwr": round(acwr_rpe, 2),
+                "aigue": round(rpe[0], 0), "chronique": round(rpe[1], 0),
+                "unite": "sRPE", "acwr_gps": None, "acwr_rpe": round(acwr_rpe, 2)}
+    return vide
+
+
+def _count_blessures_risque(joueur_id: UUID, conn, date_ref=None) -> int:
+    """Nombre de blessures NON soldées (hors RETABLI) dans les 90 jours précédant la
+    date de référence. Une blessure rétablie ne gonfle plus le risque indéfiniment."""
+    ref = date_ref or _date.today()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) FROM blessure
+                WHERE joueur_id = %s
+                  AND statut != 'RETABLI'
+                  AND date_blessure >= %s::date - INTERVAL '90 days'
+                  AND date_blessure <= %s::date
+            """, (str(joueur_id), ref, ref))
+            row = cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+    return int(row[0]) if row else 0
+
+
+def _calcul_score_risque(joueur_id: UUID, cfg: dict, conn, date_ref=None,
+                         neutraliser_acwr: bool = False) -> dict:
+    """
+    Score de risque de blessure 0-100, fondé sur l'ACWR (Acute:Chronic Workload Ratio)
+    « découplé » (Windt & Gabbett 2019) issu de la source UNIFIÉE GPS↔RPE (repli),
+    majoré par les blessures récentes et le surpoids (corrections configurables).
+    `date_ref` permet de recalculer le score à une date passée (tendance, chantier B).
+
+    `neutraliser_acwr` (préparation / reprise) : pas de baseline stable → un ACWR élevé
+    est ATTENDU et ne doit pas alarmer. On le rapporte pour information mais on plafonne
+    sa contribution au niveau « charge maîtrisée ».
+
+    Renvoie un dict : score, acwr, charges aiguë/chronique (km si GPS, None sinon),
+    source/unite de la charge, et `contributions` (points par facteur + libellé)
+    pour construire la phrase explicative et identifier le facteur dominant.
+    """
+    charge = _charge_acwr_unifiee(joueur_id, cfg, conn, date_ref)
+    acwr   = charge["acwr"]
+
+    if acwr is None:
         return {"score": 20.0, "acwr": None,
-                "charge_aigue_km": None, "charge_chronique_km": None}
+                "charge_aigue_km": None, "charge_chronique_km": None,
+                "source": None, "unite": None, "contributions": []}
 
-    charge_aigue      = float(row[0] or 0)
-    charge_chronique  = float(row[1])
-    blessures_recentes = int(row[2] or 0)
-
-    acwr = charge_aigue / charge_chronique
-    if acwr < 0.8:
-        score = 15.0
-    elif acwr <= 1.3:
-        score = 20.0 + (acwr - 0.8) * 20
+    contributions = []
+    if neutraliser_acwr:
+        # Montée de charge attendue : score neutre, on n'escalade pas sur l'ACWR.
+        score_acwr = 20.0
+        lib_acwr = f"montée de charge attendue (préparation/reprise) — ACWR {acwr} non alarmant"
     else:
-        score = 30.0 + min((acwr - 1.3) * 50, 50.0)
+        if acwr < 0.8:
+            score_acwr = 15.0
+        elif acwr <= 1.3:
+            score_acwr = 20.0 + (acwr - 0.8) * 20
+        else:
+            score_acwr = 30.0 + min((acwr - 1.3) * 50, 50.0)
 
-    score += blessures_recentes * 15
+        pct_acwr = round((acwr - 1) * 100)
+        src_txt = {"GPS": "charge", "RPE": "charge ressentie", "MIXTE": "charge"}.get(charge["source"], "charge")
+        if acwr > 1.3:
+            lib_acwr = f"{src_txt} aiguë +{pct_acwr}% au-dessus de l'habituel (ACWR {acwr})"
+        elif acwr < 0.8:
+            lib_acwr = f"sous-charge {pct_acwr}% vs habituel (ACWR {acwr})"
+        else:
+            lib_acwr = f"charge maîtrisée (ACWR {acwr})"
+    contributions.append({"facteur": "charge", "points": round(score_acwr, 1), "libelle": lib_acwr})
 
-    poids, poids_cible = _poids_a_date(joueur_id, _date.today(), conn)
+    score = score_acwr
+
+    blessures_recentes = _count_blessures_risque(joueur_id, conn, date_ref)
+    if blessures_recentes > 0:
+        pts = blessures_recentes * 15
+        score += pts
+        contributions.append({"facteur": "blessure", "points": float(pts),
+                              "libelle": f"{blessures_recentes} blessure(s) récente(s) (<90 j)"})
+
+    poids, poids_cible = _poids_a_date(joueur_id, date_ref or _date.today(), conn)
     if poids is not None and poids_cible is not None:
         ecart_kg = poids - poids_cible
         if ecart_kg > 0:
             pts_par_kg = cfg.get("correction_surpoids_pts_par_kg", 5.0)
             plafond    = cfg.get("correction_surpoids_plafond_pts", 20.0)
-            score += min(ecart_kg * pts_par_kg, plafond)
+            pts = min(ecart_kg * pts_par_kg, plafond)
+            score += pts
+            contributions.append({"facteur": "poids", "points": round(pts, 1),
+                                  "libelle": f"surpoids +{round(ecart_kg, 1)} kg vs poids de forme"})
 
     return {
         "score":               min(round(score, 1), 100.0),
-        "acwr":                round(acwr, 2),
-        "charge_aigue_km":     round(charge_aigue / 1000, 1),
-        "charge_chronique_km": round(charge_chronique / 1000, 1),
+        "acwr":                acwr,
+        "charge_aigue_km":     charge["aigue"] if charge["unite"] == "km" else None,
+        "charge_chronique_km": charge["chronique"] if charge["unite"] == "km" else None,
+        "source":              charge["source"],
+        "unite":               charge["unite"],
+        "contributions":       contributions,
+    }
+
+
+def _charge_cible(joueur_id: UUID, cfg: dict, conn) -> dict:
+    """
+    Recommandation de charge pour la semaine à venir, individualisée.
+    On part de la charge chronique hebdo (source unifiée GPS↔RPE) et on projette
+    une fourchette par les bornes ACWR : sûre [0.8 ; 1.3], idéale ~1.05.
+    Exprimée en km si GPS disponible, sinon en unités sRPE (repli).
+    Renvoie {disponible, source, unite, ...} — disponible=False si pas de base chronique.
+    """
+    charge = _charge_acwr_unifiee(joueur_id, cfg, conn)
+    chro   = charge["chronique"]
+    if chro is None or chro <= 0:
+        return {"disponible": False, "source": charge["source"], "unite": charge["unite"],
+                "phrase": "Pas assez de données de charge pour recommander une cible."}
+
+    acwr_min   = float(cfg.get("acwr_cible_min", 0.8))
+    acwr_ideal = float(cfg.get("acwr_cible_ideal", 1.05))
+    acwr_haute = float(cfg.get("acwr_cible_haute", 1.2))
+    acwr_max   = float(cfg.get("acwr_cible_max", 1.3))
+    unite = charge["unite"]
+    arr = (lambda v: round(v, 1)) if unite == "km" else (lambda v: round(v))
+
+    cible_min   = arr(chro * acwr_min)
+    cible_ideal = arr(chro * acwr_ideal)
+    cible_haute = arr(chro * acwr_haute)
+    plafond     = arr(chro * acwr_max)
+
+    phrase = (f"Charge cible semaine : {cible_min}–{cible_haute} {unite} "
+              f"(idéal ~{cible_ideal}). Plafond à ne pas dépasser : {plafond} {unite}.")
+    return {
+        "disponible":  True,
+        "source":      charge["source"],
+        "unite":       unite,
+        "chronique":   chro,
+        "acwr_actuel": charge["acwr"],
+        "cible_min":   cible_min,
+        "cible_ideal": cible_ideal,
+        "cible_haute": cible_haute,
+        "plafond":     plafond,
+        "phrase":      phrase,
     }
 
 
@@ -529,13 +889,16 @@ def _signal_srpe(joueur_id: UUID, cfg: dict, conn) -> tuple:
 
 
 def _bonus_blessure(joueur_id: UUID, cfg: dict, conn) -> tuple:
-    """Bonus si blessure récente — fenêtre et score configurables."""
+    """Bonus si blessure NON soldée récente — fenêtre et score configurables.
+    Les blessures RETABLI sont exclues : une blessure rétablie ne doit pas maintenir
+    une alerte de fatigue pendant des semaines après le retour du joueur."""
     fenetre = int(cfg.get("fenetre_blessure_fatigue_jours", 56))
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT COUNT(*)
             FROM blessure
             WHERE joueur_id = %s
+              AND statut != 'RETABLI'
               AND date_blessure >= CURRENT_DATE - INTERVAL '{fenetre} days'
         """, (str(joueur_id),))
         row = cur.fetchone()
@@ -865,8 +1228,101 @@ def _niveau_fatigue(score: float) -> str:
     return "ALERTE"
 
 
+# Ancres (score 0-100 → probabilité % de blessure à 7 jours). Mapping monotone,
+# calibrable plus tard sur les blessures observées — AUCUN apprentissage ici.
+_PROBA_ANCRES = [(0, 2), (20, 5), (30, 8), (45, 14), (60, 24), (80, 42), (100, 60)]
+
+
+def _score_vers_proba(score: float) -> int:
+    """Convertit un score de risque 0-100 en probabilité % à 7 jours (interpolation linéaire)."""
+    s = max(0.0, min(float(score), 100.0))
+    for (x0, y0), (x1, y1) in zip(_PROBA_ANCRES, _PROBA_ANCRES[1:]):
+        if s <= x1:
+            t = 0 if x1 == x0 else (s - x0) / (x1 - x0)
+            return round(y0 + t * (y1 - y0))
+    return _PROBA_ANCRES[-1][1]
+
+
+def _risque_probabiliste(joueur_id: UUID, cfg: dict, conn, ctx=None, date_ref=None) -> dict:
+    """
+    Sortie probabiliste EXPLICABLE du risque de blessure (sans ML) :
+      - probabilité estimée à 7 jours (mapping du score),
+      - facteur dominant (plus forte contribution),
+      - tendance (score actuel vs score à J-7),
+      - phrase prête à afficher.
+
+    Tient compte du CONTEXTE (saison/période/fraîcheur) : hors charge / inactif /
+    blessé → pas d'estimation sur données périmées ; préparation/reprise → ACWR neutralisé.
+    `date_ref` (date simulée) décale toute l'évaluation à une autre date.
+    """
+    from datetime import timedelta
+    if ctx is None:
+        ctx = _contexte_joueur(joueur_id, cfg, conn, date_ref)
+
+    base = {
+        "etat": ctx["etat"], "periode_type": ctx["periode_type"],
+        "periode_libelle": ctx["periode_libelle"], "jours_inactif": ctx["jours_inactif"],
+    }
+
+    if ctx["silence"]:
+        phrase = {
+            "HORS_CHARGE": f"Hors charge ({ctx['periode_libelle'] or 'trêve / intersaison'}) — "
+                           f"risque de blessure non évalué.",
+            "HORS_SAISON": "Aucune saison en cours — risque non évalué (hors saison).",
+            "INACTIF":     "Aucune donnée récente — risque non évalué (hors charge).",
+            "BLESSE":      "Joueur en cours de blessure — suivi médical, charge non évaluée.",
+        }.get(ctx["etat"], "Risque non évalué.")
+        return {**base, "score": 0.0, "probabilite": None, "niveau": "FAIBLE",
+                "phrase": phrase, "facteur_dominant": None, "tendance": "STABLE", "source": None}
+
+    risque = _calcul_score_risque(joueur_id, cfg, conn, date_ref=date_ref,
+                                  neutraliser_acwr=ctx["neutraliser_acwr"])
+    score  = risque["score"]
+    proba  = _score_vers_proba(score)
+
+    contributions = risque.get("contributions") or []
+    dominant = max(contributions, key=lambda c: c["points"], default=None)
+    facteur_dominant = dominant["libelle"] if dominant else None
+
+    # Tendance : comparaison au score d'il y a 7 jours (même neutralisation)
+    seuil = float(cfg.get("tendance_seuil_pts", 5))
+    try:
+        score_avant = _calcul_score_risque(joueur_id, cfg, conn,
+                                           date_ref=(date_ref or _date.today()) - timedelta(days=7),
+                                           neutraliser_acwr=ctx["neutraliser_acwr"])["score"]
+        delta = score - score_avant
+        if delta >= seuil:
+            tendance, fleche = "HAUSSE", "↗ en hausse"
+        elif delta <= -seuil:
+            tendance, fleche = "BAISSE", "↘ en baisse"
+        else:
+            tendance, fleche = "STABLE", "→ stable"
+    except Exception:
+        tendance, fleche = "STABLE", "→ stable"
+
+    if risque["acwr"] is None:
+        phrase = "Données de charge insuffisantes pour estimer le risque."
+    else:
+        phrase = f"Risque ~{proba} % à 7 jours"
+        if facteur_dominant:
+            phrase += f" · facteur principal : {facteur_dominant}"
+        phrase += f" · {fleche}"
+
+    return {
+        **base,
+        "score":            score,
+        "probabilite":      proba,
+        "niveau":           _niveau_risque(score),
+        "phrase":           phrase,
+        "facteur_dominant": facteur_dominant,
+        "tendance":         tendance,
+        "source":           risque.get("source"),
+    }
+
+
 @router.get("/risque/{joueur_id}", response_model=RisqueBlessure)
-def get_risque_blessure(joueur_id: UUID):
+def get_risque_blessure(joueur_id: UUID, x_date_simulee: str | None = Header(default=None)):
+    date_ref = _parse_date_simulee(x_date_simulee)
     try:
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -879,16 +1335,24 @@ def get_risque_blessure(joueur_id: UUID):
             if not joueur:
                 raise HTTPException(status_code=404, detail="Joueur introuvable")
 
-            cfg     = _load_config(conn)
-            risque  = _calcul_score_risque(joueur_id, cfg, conn)
-            score   = risque["score"]
+            cfg = _load_config(conn)
+            r   = _risque_probabiliste(joueur_id, cfg, conn, date_ref=date_ref)
 
         return RisqueBlessure(
             joueur_id=joueur_id,
             nom=joueur[1],
             prenom=joueur[2],
-            score_risque=score,
-            niveau=_niveau_risque(score),
+            score_risque=r["score"],
+            niveau=r["niveau"],
+            probabilite=r["probabilite"],
+            phrase=r["phrase"],
+            facteur_dominant=r["facteur_dominant"],
+            tendance=r["tendance"],
+            source=r["source"],
+            etat=r.get("etat"),
+            periode_type=r.get("periode_type"),
+            periode_libelle=r.get("periode_libelle"),
+            jours_inactif=r.get("jours_inactif"),
         )
     except HTTPException:
         raise
@@ -896,8 +1360,27 @@ def get_risque_blessure(joueur_id: UUID):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/charge-cible/{joueur_id}", response_model=ChargeCible)
+def get_charge_cible(joueur_id: UUID):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM joueur WHERE id = %s", (str(joueur_id),))
+                if not cur.fetchone():
+                    raise HTTPException(status_code=404, detail="Joueur introuvable")
+            cfg = _load_config(conn)
+            c   = _charge_cible(joueur_id, cfg, conn)
+
+        return ChargeCible(joueur_id=joueur_id, **c)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/fatigue/{joueur_id}", response_model=NiveauFatigue)
-def get_fatigue(joueur_id: UUID):
+def get_fatigue(joueur_id: UUID, x_date_simulee: str | None = Header(default=None)):
+    date_ref = _parse_date_simulee(x_date_simulee)
     try:
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -910,8 +1393,21 @@ def get_fatigue(joueur_id: UUID):
             if not joueur:
                 raise HTTPException(status_code=404, detail="Joueur introuvable")
 
-            cfg     = _load_config(conn)
-            fatigue = _calcul_fatigue(joueur_id, cfg, conn)
+            cfg = _load_config(conn)
+            ctx = _contexte_joueur(joueur_id, cfg, conn, date_ref)
+            if ctx["silence"]:
+                ji = ctx["jours_inactif"]
+                depuis = f" depuis {ji} j" if ji is not None else ""
+                libelle_periode = ctx["periode_libelle"] or "trêve / intersaison"
+                raison = {
+                    "HORS_CHARGE": f"Hors charge ({libelle_periode}) — pas de suivi de fatigue.",
+                    "HORS_SAISON": "Aucune saison en cours — pas de suivi de fatigue.",
+                    "INACTIF":     f"Aucune donnée récente{depuis} — fatigue non évaluée.",
+                    "BLESSE":      "Joueur en cours de blessure — fatigue d'entraînement non évaluée.",
+                }.get(ctx["etat"], "Fatigue non évaluée.")
+                fatigue = {"score": 0.0, "niveau": "NOMINAL", "raison": raison}
+            else:
+                fatigue = _calcul_fatigue(joueur_id, cfg, conn)
 
         return NiveauFatigue(
             joueur_id=joueur_id,
@@ -927,8 +1423,33 @@ def get_fatigue(joueur_id: UUID):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _equipes_scope(x_contexte_equipes, x_contexte_club, conn):
+    """
+    Équipes sur lesquelles scoper une vue d'équipe, d'après les en-têtes de contexte transmis
+    par le BACK Java (qui a déjà résolu la portée autorisée via ScopeResolver — Python ne fait
+    que filtrer ce que le back lui demande) :
+      X-Contexte-Equipes (CSV d'ids) prioritaire, sinon toutes les équipes de X-Contexte-Club.
+    Retourne une liste d'equipe_id (str) ou None = pas de scoping (le back n'a rien transmis).
+    """
+    if x_contexte_equipes:
+        ids = [e.strip() for e in x_contexte_equipes.split(",") if e.strip()]
+        return ids or None
+    if x_contexte_club and x_contexte_club.strip():
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM equipe WHERE club_id = %s", (x_contexte_club.strip(),))
+                ids = [str(r[0]) for r in cur.fetchall()]
+            return ids or None
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
+    return None
+
+
 @router.get("/charge-collective")
-def get_charge_collective(semaines: int = 4):
+def get_charge_collective(semaines: int = 4,
+                          x_contexte_equipes: str | None = Header(default=None),
+                          x_contexte_club: str | None = Header(default=None)):
     """
     Charge collective (km) par semaine glissante sur les `semaines` dernières
     semaines (4, 8 ou 12). Index 0 = la plus ancienne, dernier = semaine en cours.
@@ -937,9 +1458,14 @@ def get_charge_collective(semaines: int = 4):
     jours = semaines * 7
     try:
         with get_connection() as conn:
+            scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
+            extra = ""
+            qp: list = [semaines, jours]
+            if scope:
+                extra = " AND s.equipe_id = ANY(%s)"; qp.append(scope)
             with conn.cursor() as cur:
                 # bucket : 0 = semaine la plus ancienne … (semaines-1) = semaine en cours
-                cur.execute("""
+                cur.execute(f"""
                     SELECT
                         %s - 1 - FLOOR((CURRENT_DATE - s.date) / 7)::int AS semaine_idx,
                         ROUND(SUM(dg.distance_totale_m) / 1000.0, 1) AS total_km
@@ -947,10 +1473,10 @@ def get_charge_collective(semaines: int = 4):
                     JOIN seance s ON dg.seance_id = s.id
                     JOIN joueur j ON j.id = dg.joueur_id
                     WHERE s.date >= CURRENT_DATE - (%s || ' days')::interval
-                      AND j.statut != 'inactif'
+                      AND j.statut != 'inactif'{extra}
                     GROUP BY 1
                     ORDER BY 1
-                """, (semaines, jours))
+                """, tuple(qp))
                 rows = cur.fetchall()
 
         data = [0.0] * semaines
@@ -1132,7 +1658,9 @@ def get_rapport_seance(seance_id: UUID):
 
 
 @router.get("/equipe/charge")
-def get_charge_equipe(debut: str | None = None, fin: str | None = None, types: str | None = None):
+def get_charge_equipe(debut: str | None = None, fin: str | None = None, types: str | None = None,
+                      x_contexte_equipes: str | None = Header(default=None),
+                      x_contexte_club: str | None = Header(default=None)):
     """
     Charge externe agrégée de l'équipe sur une période.
     Renvoie deux vues :
@@ -1148,6 +1676,7 @@ def get_charge_equipe(debut: str | None = None, fin: str | None = None, types: s
             cfg = _load_config(conn)
             sous_seuil = cfg.get("seuil_sous_norme_pct", 20.0)
             sur_seuil  = cfg.get("seuil_sur_norme_pct",  20.0)
+            scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
 
             # Historique des ratios par (joueur, type), du plus récent au plus ancien.
             # Baseline d'une séance = moyenne des 10 plus récentes du même type, HORS séance
@@ -1167,9 +1696,11 @@ def get_charge_equipe(debut: str | None = None, fin: str | None = None, types: s
                         continue
                     hist.setdefault((str(jid_), str(tid_)), []).append((str(sid_), float(ratio_)))
 
-            # Lignes GPS de la période (filtre type optionnel).
+            # Lignes GPS de la période (scoping équipe via contexte + filtre type optionnel).
             params: list = []
             where = ["j.statut != 'inactif'"]
+            if scope:
+                where.append("s.equipe_id = ANY(%s)"); params.append(scope)
             if debut:
                 where.append("s.date >= %s"); params.append(debut)
             if fin:
@@ -1295,43 +1826,96 @@ def get_charge_equipe(debut: str | None = None, fin: str | None = None, types: s
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _joueurs_resume(conn, scope=None):
+    """
+    Périmètre du résumé d'équipe : l'effectif des saisons EN_COURS si la notion de
+    saison/effectif existe ET est renseignée ; sinon repli LEGACY sur tous les joueurs
+    actifs (non-breaking tant qu'aucune saison n'a été ouverte).
+    `scope` (liste d'equipe_id du contexte) restreint aux équipes ciblées.
+    """
+    try:
+        with conn.cursor() as cur:
+            extra = ""; params: list = []
+            if scope:
+                extra = " AND j.equipe_id = ANY(%s)"; params.append(scope)
+            cur.execute(f"""
+                SELECT j.id, j.nom, j.prenom, j.poste_principal
+                FROM joueur j
+                JOIN effectif_saison es ON es.joueur_id = j.id
+                JOIN saison s ON s.id = es.saison_id AND s.statut = 'EN_COURS'
+                WHERE j.statut != 'inactif'{extra}
+                GROUP BY j.id, j.nom, j.prenom, j.poste_principal
+                ORDER BY j.nom, j.prenom
+            """, params)
+            rows = cur.fetchall()
+        if rows:
+            return rows
+    except Exception:
+        try: conn.rollback()
+        except Exception: pass
+    # Repli legacy
+    with conn.cursor() as cur:
+        extra = ""; params = []
+        if scope:
+            extra = " AND equipe_id = ANY(%s)"; params.append(scope)
+        cur.execute(f"""
+            SELECT id, nom, prenom, poste_principal
+            FROM joueur WHERE statut != 'inactif'{extra} ORDER BY nom, prenom
+        """, params)
+        return cur.fetchall()
+
+
 @router.get("/equipe", response_model=List[ResumeJoueur])
-def get_resume_equipe():
+def get_resume_equipe(x_date_simulee: str | None = Header(default=None),
+                      x_contexte_equipes: str | None = Header(default=None),
+                      x_contexte_club: str | None = Header(default=None)):
+    date_ref = _parse_date_simulee(x_date_simulee)
     try:
         with get_connection() as conn:
             cfg = _load_config(conn)
-
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, nom, prenom, poste_principal
-                    FROM joueur
-                    WHERE statut != 'inactif'
-                    ORDER BY nom, prenom
-                """)
-                joueurs = cur.fetchall()
+            scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
+            joueurs = _joueurs_resume(conn, scope)
 
             resultats = []
             for j in joueurs:
-                joueur_id    = UUID(str(j[0]))
-                risque       = _calcul_score_risque(joueur_id, cfg, conn)
-                score_risque = risque["score"]
-                fatigue      = _calcul_fatigue(joueur_id, cfg, conn)
+                joueur_id = UUID(str(j[0]))
+                ctx = _contexte_joueur(joueur_id, cfg, conn, date_ref)
                 readiness, readiness_date = _readiness_joueur(joueur_id, conn)
-                sprint = _sprint_neuromusculaire(joueur_id, cfg, conn)
+
+                # Champs de contexte communs (toujours renvoyés pour l'UI).
+                commun = dict(
+                    joueur_id=joueur_id, nom=j[1], prenom=j[2], poste=j[3],
+                    readiness=readiness, readiness_date=readiness_date,
+                    etat=ctx["etat"], periode_type=ctx["periode_type"],
+                    periode_libelle=ctx["periode_libelle"], jours_inactif=ctx["jours_inactif"],
+                    blessure_jours_restants=ctx["blessure_jours_restants"],
+                )
+
+                # Hors charge / inactif / blessé : aucune alerte calculée sur des données
+                # périmées — indicateurs neutres, le joueur sort des « à surveiller ».
+                if ctx["silence"]:
+                    resultats.append(ResumeJoueur(
+                        **commun,
+                        score_risque=0.0, score_fatigue=0.0,
+                        niveau_risque="FAIBLE", niveau_fatigue="NOMINAL",
+                        acwr=None, charge_aigue_km=None, charge_chronique_km=None,
+                        monotonie=None, sprint_niveau=None, sprint_message=None,
+                    ))
+                    continue
+
+                risque  = _calcul_score_risque(joueur_id, cfg, conn, date_ref=date_ref,
+                                               neutraliser_acwr=ctx["neutraliser_acwr"])
+                fatigue = _calcul_fatigue(joueur_id, cfg, conn)
+                sprint  = _sprint_neuromusculaire(joueur_id, cfg, conn)
                 resultats.append(ResumeJoueur(
-                    joueur_id=joueur_id,
-                    nom=j[1],
-                    prenom=j[2],
-                    poste=j[3],
-                    score_risque=score_risque,
+                    **commun,
+                    score_risque=risque["score"],
                     score_fatigue=fatigue["score"],
-                    niveau_risque=_niveau_risque(score_risque),
+                    niveau_risque=_niveau_risque(risque["score"]),
                     niveau_fatigue=fatigue["niveau"],
                     acwr=risque["acwr"],
                     charge_aigue_km=risque["charge_aigue_km"],
                     charge_chronique_km=risque["charge_chronique_km"],
-                    readiness=readiness,
-                    readiness_date=readiness_date,
                     monotonie=_monotonie_joueur(joueur_id, cfg, conn),
                     sprint_niveau=sprint["niveau"],
                     sprint_message=sprint["message"],
