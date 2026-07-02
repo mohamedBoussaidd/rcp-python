@@ -1448,31 +1448,37 @@ def _equipes_scope(x_contexte_equipes, x_contexte_club, conn):
 
 @router.get("/charge-collective")
 def get_charge_collective(semaines: int = 4,
+                          x_date_simulee: str | None = Header(default=None),
                           x_contexte_equipes: str | None = Header(default=None),
                           x_contexte_club: str | None = Header(default=None)):
     """
     Charge collective (km) par semaine glissante sur les `semaines` dernières
     semaines (4, 8 ou 12). Index 0 = la plus ancienne, dernier = semaine en cours.
+    La « semaine en cours » est ancrée sur la date simulée (X-Date-Simulee, super-admin)
+    quand elle est fournie, sinon sur la date réelle ; les séances postérieures sont exclues.
     """
     semaines = semaines if semaines in (4, 8, 12) else 4
     jours = semaines * 7
+    ref = _parse_date_simulee(x_date_simulee) or _date.today()
     try:
         with get_connection() as conn:
             scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
             extra = ""
-            qp: list = [semaines, jours]
+            # Ordre des paramètres = ordre des %s dans la requête (ref utilisée 3×).
+            qp: list = [semaines, ref, ref, jours, ref]
             if scope:
                 extra = " AND s.equipe_id = ANY(%s)"; qp.append(scope)
             with conn.cursor() as cur:
-                # bucket : 0 = semaine la plus ancienne … (semaines-1) = semaine en cours
+                # bucket : 0 = semaine la plus ancienne … (semaines-1) = semaine en cours (= ref)
                 cur.execute(f"""
                     SELECT
-                        %s - 1 - FLOOR((CURRENT_DATE - s.date) / 7)::int AS semaine_idx,
+                        %s - 1 - FLOOR((%s::date - s.date) / 7)::int AS semaine_idx,
                         ROUND(SUM(dg.distance_totale_m) / 1000.0, 1) AS total_km
                     FROM donnee_gps dg
                     JOIN seance s ON dg.seance_id = s.id
                     JOIN joueur j ON j.id = dg.joueur_id
-                    WHERE s.date >= CURRENT_DATE - (%s || ' days')::interval
+                    WHERE s.date >= %s::date - (%s || ' days')::interval
+                      AND s.date <= %s::date
                       AND j.statut != 'inactif'{extra}
                     GROUP BY 1
                     ORDER BY 1

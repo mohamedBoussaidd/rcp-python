@@ -1,98 +1,103 @@
 """
-Purge du tenant démo (confinée à l'équipe démo) — teardown complet du CONTENU.
+Purge MULTI-CLUB du jeu de démo (chantier A), confinée aux clubs de config.PROFILS.
 
-Ordre pensé pour respecter les contraintes FK :
-  matchs → blessures → séances (→ GPS en cascade) → fiches joueurs
-  (→ wellness, RPE, pesées, conseils perso, présences EN CASCADE) → conseils
-  d'équipe restants → formations/schémas → comptes JOUEUR.
+Pour chaque club de démo, on se connecte comme son PRÉSIDENT et on supprime le CONTENU :
+  matchs + blessures (par équipe) → séances (→ GPS en cascade) → fiches joueurs
+  (→ wellness/RPE/pesées/présences/conseils perso en cascade) → conseils d'équipe →
+  formations/schémas → comptes JOUEUR & workers de démo.
 
-La suppression des FICHES joueurs efface wellness/RPE/pesées via les FK
-ON DELETE CASCADE (il n'existe pas d'endpoint DELETE direct pour wellness/RPE).
-Comme utilisateur.joueur_id est en SET NULL, on supprime aussi les comptes JOUEUR
-pour qu'une réinjection les recrée correctement liés aux nouvelles fiches.
+Conservés : les clubs, leurs présidents (login démo) et les équipes. Pour repartir de
+zéro complet, supprimez les clubs à la main côté super-admin.
 
-Conservés : l'équipe démo, les comptes workers et le président (socle léger).
-
-Note : pour un simple rafraîchissement, ne PAS purger — relancer la génération
-suffit (séances réutilisées par date, données upsertées, aucun doublon).
+Note : pour un simple rafraîchissement, ne PAS purger — relancer la génération suffit
+(séances réutilisées par date, données upsertées, épisodiques nettoyés avant re-push).
 """
 
 from __future__ import annotations
 
 from . import config
+from .api_client import ApiClient
 from .bootstrap import BootstrapContext
 
 
-def purger(ctx: BootstrapContext, log=print) -> None:
-    coach = ctx.workers["entraineur"]
-    prepa = ctx.workers["preparateur"]
-    medic = ctx.workers["medical"]
+# ═══════════════════════════ Purge multi-club ═══════════════════════════
 
-    # 1) Matchs (module tactique)
-    matchs = coach.get("/api/matchs") or []
-    for m in matchs:
-        coach.delete(f"/api/matchs/{m['id']}")
-    log(f"  {len(matchs)} matchs supprimés")
+def purger_tout(admin: ApiClient, base_url: str, log=print) -> None:
+    for profil in config.PROFILS:
+        club_id = _trouver_club(admin, profil.nom)
+        if not club_id:
+            log(f"  club « {profil.nom} » absent — rien à purger")
+            continue
+        log(f"\n=== Purge « {profil.nom} » ===")
+        pres = ApiClient(base_url)
+        pres.login(profil.president_email, config.PRESIDENT_DEMO_PASSWORD)
+        pres.set_contexte(club_id=club_id)
+        equipes = pres.get("/api/mon-club").get("equipes", [])
 
-    # 2) Blessures (FK joueur sans cascade → avant la suppression des fiches)
-    blessures = medic.get("/api/blessures") or []
-    for b in blessures:
-        medic.delete(f"/api/blessures/{b['id']}")
-    log(f"  {len(blessures)} blessures supprimées")
+        # 1) Matchs + blessures : endpoints « 1 équipe active » → on itère par équipe.
+        nb_m = nb_b = 0
+        for e in equipes:
+            pres.set_contexte(club_id=club_id, equipe_ids=[e["id"]])
+            for m in pres.get("/api/matchs") or []:
+                pres.delete(f"/api/matchs/{m['id']}"); nb_m += 1
+            for b in pres.get("/api/blessures") or []:
+                pres.delete(f"/api/blessures/{b['id']}"); nb_b += 1
+        log(f"  {nb_m} matchs, {nb_b} blessures supprimés")
 
-    # 3) Séances (GPS supprimé en cascade côté service ; FK gps→joueur sans cascade)
-    seances = prepa.get("/api/seances") or []
-    for s in seances:
-        prepa.delete(f"/api/seances/{s['id']}")
-    log(f"  {len(seances)} séances supprimées (+ GPS en cascade)")
+        # 2) Le reste au niveau club (contexte = toutes les équipes).
+        pres.set_contexte(club_id=club_id, equipe_ids=[e["id"] for e in equipes])
+        nb_s = _supprimer_liste(pres, "/api/seances")
+        log(f"  {nb_s} séances supprimées (+ GPS en cascade)")
+        nb_j = _supprimer_liste(pres, "/api/joueurs/tous", "/api/joueurs")
+        log(f"  {nb_j} fiches joueurs supprimées (+ wellness/RPE/pesées/présences en cascade)")
+        nb_c = _supprimer_liste(pres, "/api/conseils")
+        nb_c += _supprimer_liste(pres, "/api/formations")
+        nb_c += _supprimer_liste(pres, "/api/schemas")
+        log(f"  {nb_c} conseils + éléments tactiques supprimés")
 
-    # 4) Fiches joueurs → cascade wellness / RPE / pesées / conseils perso / présences
-    joueurs = prepa.get("/api/joueurs/tous") or []
-    for j in joueurs:
-        prepa.delete(f"/api/joueurs/{j['id']}")
-    log(f"  {len(joueurs)} fiches joueurs supprimées (+ wellness/RPE/pesées en cascade)")
+        # 3) Comptes de démo (workers + joueurs) du club, repérés par domaine email.
+        nb_comptes = 0
+        for m in pres.get("/api/mon-club/membres") or []:
+            email = (m.get("email") or "").lower()
+            if email.endswith("@" + config.JOUEUR_EMAIL_DOMAIN) or email.endswith("@" + config.WORKER_EMAIL_DOMAIN):
+                pres.delete(f"/api/membres/{m['id']}"); nb_comptes += 1
+        log(f"  {nb_comptes} comptes de démo (workers + joueurs) supprimés")
 
-    # 5) Conseils d'équipe restants (joueur_id null → non cascadés)
-    conseils = medic.get("/api/conseils") or []
-    for c in conseils:
-        medic.delete(f"/api/conseils/{c['id']}")
-    log(f"  {len(conseils)} conseils d'équipe supprimés")
 
-    # 6) Formations & schémas (niveau club)
-    nb = 0
-    for f in coach.get("/api/formations") or []:
-        coach.delete(f"/api/formations/{f['id']}")
-        nb += 1
-    for s in coach.get("/api/schemas") or []:
-        coach.delete(f"/api/schemas/{s['id']}")
-        nb += 1
-    log(f"  {nb} éléments tactiques supprimés")
+def _trouver_club(admin: ApiClient, nom: str) -> str | None:
+    for c in admin.get("/api/clubs") or []:
+        if c.get("nom") == nom:
+            return c["id"]
+    return None
 
-    # 7) Comptes JOUEUR (pour re-création liée à la réinjection)
-    membres = ctx.president.get("/api/mon-club/membres") or []
-    nb_comptes = 0
-    for m in membres:
-        if (m.get("email") or "").lower().endswith("@" + config.JOUEUR_EMAIL_DOMAIN):
-            ctx.president.delete(f"/api/membres/{m['id']}")
-            nb_comptes += 1
-    log(f"  {nb_comptes} comptes JOUEUR supprimés")
 
+def _supprimer_liste(client: ApiClient, path_get: str, path_delete: str | None = None) -> int:
+    base = path_delete or path_get
+    n = 0
+    for x in client.get(path_get) or []:
+        client.delete(f"{base}/{x['id']}")
+        n += 1
+    return n
+
+
+# ═══════════════════════ Nettoyage avant re-push (idempotence) ═══════════════════════
 
 def nettoyer_episodiques(ctx: BootstrapContext, log=print) -> None:
-    """Supprime ce qui n'a pas d'upsert naturel (blessures, conseils, matchs) afin
-    qu'une réinjection ne crée pas de doublons. Les séances (et donc GPS/RPE) sont
-    conservées et réutilisées (idempotence par date)."""
-    coach = ctx.workers["entraineur"]
-    prepa = ctx.workers["preparateur"]
-    medic = ctx.workers["medical"]
+    """Supprime ce qui n'a pas d'upsert naturel (blessures, matchs, conseils) pour éviter les
+    doublons à la réinjection. Tier-aware : n'agit que si le worker concerné existe (medical = Pro)."""
+    coach = ctx.workers.get("entraineur")
+    medic = ctx.workers.get("medical")
+    prepa = ctx.workers.get("preparateur")
 
-    for b in medic.get("/api/blessures") or []:
-        medic.delete(f"/api/blessures/{b['id']}")
-    for m in coach.get("/api/matchs") or []:
-        coach.delete(f"/api/matchs/{m['id']}")
-    ids = {c["id"] for c in (medic.get("/api/conseils") or [])}
-    for j in prepa.get("/api/joueurs/tous") or []:
-        for c in medic.get("/api/conseils", params={"joueurId": j["id"]}) or []:
-            ids.add(c["id"])
-    for cid in ids:
-        medic.delete(f"/api/conseils/{cid}")
+    if coach is not None:
+        for m in coach.get("/api/matchs") or []:
+            coach.delete(f"/api/matchs/{m['id']}")
+    if medic is not None:
+        for b in medic.get("/api/blessures") or []:
+            medic.delete(f"/api/blessures/{b['id']}")
+        ids = {c["id"] for c in (medic.get("/api/conseils") or [])}
+        for j in (prepa.get("/api/joueurs/tous") or []) if prepa else []:
+            for c in medic.get("/api/conseils", params={"joueurId": j["id"]}) or []:
+                ids.add(c["id"])
+        for cid in ids:
+            medic.delete(f"/api/conseils/{cid}")

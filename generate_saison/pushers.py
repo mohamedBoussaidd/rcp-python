@@ -311,7 +311,109 @@ def pousser_formations_et_schemas(ctx: BootstrapContext) -> int:
     return n
 
 
+# ─────────────────────────── Présence (appel) ───────────────────────────
+
+def pousser_presence(ctx: BootstrapContext, saison: SaisonSimulee) -> int:
+    """Feuille d'appel des ENTRAÎNEMENTS : PRÉSENT par défaut, seules les déviations sont stockées."""
+    prepa = ctx.worker("presence")
+    rng = np.random.default_rng(saison.params.seed + 13)
+    total = 0
+    for s in saison.seances:
+        if s.est_match or not s.backend_id:
+            continue
+        lignes = []
+        for j in saison.effectif:
+            if not j.backend_id:
+                continue
+            r = rng.random()
+            if r < 0.06:
+                statut, note = "ABSENT", ["", "Raison personnelle", "Souffrant"][int(rng.integers(0, 3))]
+            elif r < 0.09:
+                statut, note = "EXCUSE", "Excusé"
+            elif r < 0.12:
+                statut, note = "RETARD", "Arrivé en retard"
+            else:
+                continue  # PRÉSENT → non stocké
+            lignes.append({"joueurId": j.backend_id, "statut": statut, "note": note or None})
+        if lignes:
+            prepa.put(f"/api/seances/{s.backend_id}/presence", json={"lignes": lignes})
+            total += len(lignes)
+    return total
+
+
+# ─────────────────────────── Diaporama (TV / vidéoprojecteur) ───────────────────────────
+
+def pousser_diaporama(ctx: BootstrapContext) -> int:
+    """Un diaporama de briefing publié (idempotent par titre). Best-effort (n'interrompt jamais le run)."""
+    coach = ctx.workers.get("entraineur")
+    if coach is None:
+        return 0
+    titre = "Briefing tactique (démo)"
+    try:
+        if any(d.get("titre") == titre for d in (coach.get("/api/diaporamas") or [])):
+            return 0
+        did = coach.post("/api/diaporamas", json={"titre": titre})["id"]
+        coach.post(f"/api/diaporamas/{did}/slides",
+                   json={"type": "TEXTE", "titre": "Objectifs du match",
+                         "texte": "Bloc médian, pressing coordonné à la perte, largeur offensive."})
+        coach.post(f"/api/diaporamas/{did}/slides",
+                   json={"type": "SCHEMA", "titre": "Organisation 4-3-3", "schemaJson": _FORMATION_433})
+        coach.put(f"/api/diaporamas/{did}",
+                  json={"titre": titre, "visibilite": "EQUIPE", "statut": "PUBLIE"})
+        return 1
+    except Exception:
+        return 0
+
+
+# ─────────────────────────── Notifications (chat staff → joueurs) ───────────────────────────
+
+def pousser_notifications(ctx: BootstrapContext) -> int:
+    """Quelques messages d'équipe (→ notifications joueurs). Idempotent : rien si déjà envoyés."""
+    coach = ctx.workers.get("entraineur")
+    if coach is None:
+        return 0
+    try:
+        if coach.get("/api/notifications/messages/envoyes"):
+            return 0
+        messages = [
+            ("Convocation match", "Rendez-vous samedi 13h au stade, tenue complète."),
+            ("Récupération", "Séance de récupération demain matin — présence importante."),
+            ("Rappel wellness", "Pensez à remplir votre ressenti quotidien et à signaler toute gêne."),
+        ]
+        for titre, corps in messages:
+            coach.post("/api/notifications/messages", json={"titre": titre, "corps": corps})
+        return len(messages)
+    except Exception:
+        return 0
+
+
 # ─────────────────────────── Orchestration ───────────────────────────
+
+def pousser_tier(ctx: BootstrapContext, saison: SaisonSimulee, log=print) -> None:
+    """Pousse les données d'UNE équipe en filtrant selon le PACK du club (cf. ProfilClub).
+    Un niveau bas ne génère ni GPS, ni tactique, ni médical → aucune donnée fantôme masquée."""
+    from .purge import nettoyer_episodiques
+    p = ctx.profil
+    log(f"→ [{p.nom} / {ctx.equipe_nom}] injection…")
+    nettoyer_episodiques(ctx, log)
+
+    ex = pousser_exercices(ctx) if p.tactique else {}
+    log(f"  séances : {pousser_seances(ctx, saison, ex)} créées"
+        + (f", {len(ex)} exercices" if p.tactique else " (sans contenu tactique)"))
+    log(f"  présence : {pousser_presence(ctx, saison)} déviations")
+    if p.gps:
+        log(f"  GPS : {pousser_gps(ctx, saison)} lignes")
+    log(f"  pesées : {pousser_pesees(ctx, saison)}")
+    log(f"  wellness : {pousser_wellness(ctx, saison)} · RPE : {pousser_rpe(ctx, saison)}")
+    log(f"  matchs : {pousser_matchs(ctx, saison)}")
+    if p.medical:
+        log(f"  blessures : {pousser_blessures(ctx, saison)} · conseils : {pousser_conseils(ctx, saison)}")
+    if p.tactique:
+        log(f"  plan de jeu : {pousser_plan_de_jeu(ctx)} sections · "
+            f"tactique : {pousser_formations_et_schemas(ctx)} · diaporama : {pousser_diaporama(ctx)}")
+    if p.notifications:
+        log(f"  notifications : {pousser_notifications(ctx)} messages")
+
 
 def pousser_tout(ctx: BootstrapContext, saison: SaisonSimulee, inclure_tactique: bool = True,
                  log=print) -> None:

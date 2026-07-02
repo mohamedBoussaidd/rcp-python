@@ -12,6 +12,7 @@ démo, paramètres de saison et garde-fous.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -69,6 +70,7 @@ ROLE_POUR = {
     "pesees": "preparateur",
     "gps": "preparateur",
     "seances": "preparateur",
+    "presence": "preparateur",
     "wellness_traitement": "preparateur",
     "blessures": "medical",
     "conseils": "medical",
@@ -111,9 +113,80 @@ class ParametresSaison:
     taux_saisie_wellness: float = 0.85
     taux_saisie_rpe: float = 0.90
 
+    # Intensité globale (réalisme par niveau) : multiplie les volumes GPS. 1.0 = pro.
+    intensite: float = 1.0
+
     def annee_libelle(self) -> str:
         fin = self.debut_saison.year + 1
         return f"{self.debut_saison.year}-{fin}"
 
 
 DEFAUT = ParametresSaison()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Multi-club / multi-niveau (chantier A) — 3 clubs de démo pilotés par un SUPER_ADMIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Le SUPER_ADMIN qui pilote (création de clubs + affectation des packs) est un compte
+# EXISTANT réutilisé : identifiants fournis via --admin-email/--admin-password ou les
+# variables d'environnement ci-dessous. Jamais commités.
+ADMIN_EMAIL_ENV = "RCP_ADMIN_EMAIL"
+ADMIN_PASSWORD_ENV = "RCP_ADMIN_PASSWORD"
+
+
+def admin_credentials(cli_email: str | None = None, cli_password: str | None = None) -> tuple[str | None, str | None]:
+    """Identifiants du super-admin : CLI prioritaire, sinon variables d'environnement."""
+    return (cli_email or os.environ.get(ADMIN_EMAIL_ENV),
+            cli_password or os.environ.get(ADMIN_PASSWORD_ENV))
+
+
+# Mot de passe des présidents de démo (créés par la création de club, un par club).
+PRESIDENT_DEMO_PASSWORD = "DemoPresident2026!"
+
+# Noms/catégories d'équipes (indexés par position ; on en prend nb_equipes).
+EQUIPE_NOMS = ("Équipe Première", "Équipe Réserve", "Équipe U19")
+EQUIPE_CATEGORIES = ("Senior", "Réserve", "U19")
+
+# Permissions du rôle custom « Entraîneur adjoint » (club Pro) : entraînement + tactique,
+# sans gestion des comptes/club ni médical/GPS. Codes validés contre le catalogue backend.
+ROLE_CUSTOM_ADJOINT_PERMS = (
+    "seances:write", "presence:write", "exercices:write",
+    "formations:write", "schemas:write", "plandejeu:write", "matchs:write",
+)
+
+
+@dataclass(frozen=True)
+class ProfilClub:
+    """Un club de démo et son niveau : pack, effectif, et les FAMILLES de données à générer
+    (alignées sur le pack → pas de données fantômes masquées)."""
+    cle: str                # identifiant interne (amateur / semi / pro)
+    nom: str                # nom du club
+    pack: str               # code pack backend (prepa / performance / complet)
+    nb_equipes: int
+    nb_joueurs: int         # effectif par équipe
+    intensite: float        # réalisme des volumes GPS (amateur < semi < pro)
+    gps: bool               # importer du GPS
+    tactique: bool          # exercices, plan de jeu, schémas, formations, diaporama
+    medical: bool           # blessures / RTP / conseils
+    notifications: bool     # historique de notifications
+    role_custom: str | None # libellé d'un rôle custom à créer (ou None)
+    president_email: str
+    president_prenom: str
+    president_nom: str
+
+
+PROFILS: tuple[ProfilClub, ...] = (
+    ProfilClub("amateur", "AS Amateurs (Démo)", "prepa", 1, 18, 0.88,
+               gps=False, tactique=False, medical=False, notifications=False,
+               role_custom=None,
+               president_email="president.amateurs@demo.fr", president_prenom="Alain", president_nom="Amateur"),
+    ProfilClub("semi", "FC Semi-Pro (Démo)", "performance", 2, 25, 0.95,
+               gps=True, tactique=True, medical=False, notifications=False,
+               role_custom=None,
+               president_email="president.semi@demo.fr", president_prenom="Sabine", president_nom="Semipro"),
+    ProfilClub("pro", "Olympique Pro (Démo)", "complet", 3, 25, 1.0,
+               gps=True, tactique=True, medical=True, notifications=True,
+               role_custom="Entraîneur adjoint",
+               president_email="president.pro@demo.fr", president_prenom="Paul", president_nom="Pro"),
+)

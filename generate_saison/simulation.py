@@ -193,7 +193,7 @@ def simuler(params: ParametresSaison) -> SaisonSimulee:
             if seance is not None and not blesse_aujourdhui:
                 minutes = _minutes_jouees(j, seance, feuilles_match, rng)
                 if minutes > 0:
-                    mesure, charge_jour = _generer_gps(j, seance, minutes, etat, rng)
+                    mesure, charge_jour = _generer_gps(j, seance, minutes, etat, rng, params.intensite)
                     saison.gps.append(mesure)
                     saison.rpe.append(_generer_rpe(j, seance, minutes, etat, rng))
                     session_norm = min(1.0, charge_jour / _CHARGE_NORM)
@@ -261,10 +261,11 @@ def _minutes_jouees(joueur, seance, feuilles_match, rng) -> int:
 
 # ─────────────────────────── Génération GPS ───────────────────────────
 
-def _generer_gps(joueur, seance, minutes, etat, rng):
+def _generer_gps(joueur, seance, minutes, etat, rng, intensite: float = 1.0):
     fam = joueur.famille
     dmin, dmax = catalog.DIST_REFERENCE[seance.type_code]
-    dist_ref = float(rng.uniform(dmin, dmax)) * catalog.MOD_DISTANCE[fam]
+    # Intensité globale du niveau (amateur < semi < pro), bornée pour rester réaliste.
+    dist_ref = float(rng.uniform(dmin, dmax)) * catalog.MOD_DISTANCE[fam] * float(intensite)
 
     # Pour un match/entraînement écourté, distance proportionnelle aux minutes.
     if seance.est_match:

@@ -1,26 +1,31 @@
 """
-Bootstrap du tenant démo via l'API.
+Bootstrap MULTI-CLUB du jeu de démo via l'API (chantier A).
 
-À partir du SEUL compte président créé à la main (compte@demo.fr), le générateur
-met en place tout le reste, de façon idempotente :
-  1. l'équipe démo (sous le club du président) ;
-  2. les comptes "workers" (PREPARATEUR / ENTRAINEUR / MEDICAL) rattachés à
-     l'équipe — ils portent les droits d'écriture spécialisés (cf. SecurityConfig)
-     et un equipeId, indispensable car equipePourEcriture() lit l'équipe du compte ;
-  3. les 25 fiches joueurs (créées par le préparateur) ;
-  4. un compte JOUEUR par fiche (pour la saisie wellness/RPE côté joueur).
+Piloté par un SUPER_ADMIN existant (réutilisé), le générateur met en place, de façon
+idempotente, 3 clubs de niveaux différents (cf. config.PROFILS) :
 
-Renvoie un BootstrapContext : clients authentifiés + identifiants utiles.
+  1. création du club + de son PRÉSIDENT (POST /api/clubs — un login démo par club) ;
+  2. affectation du PACK du club (PUT /api/admin/clubs/{id}/pack) ;
+  3. pour chaque équipe du club : workers scopés à l'équipe (PREPARATEUR / ENTRAINEUR
+     [+ MEDICAL si niveau], portant les droits d'écriture), fiches joueurs, comptes
+     JOUEUR (saisie wellness/RPE), et la saison + périodes + effectif ;
+  4. pour le club Pro : un rôle custom « Entraîneur adjoint ».
+
+Chaque équipe donne un BootstrapContext (comme l'ancien mono-club), consommé ensuite
+par les pushers filtrés selon le niveau du club.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import unicodedata
 from dataclasses import dataclass, field
 
 from . import catalog, config
 from .api_client import ApiClient, ApiError
+from .config import ProfilClub
 from .profils import Joueur
+from .simulation import SaisonSimulee, simuler
 
 
 # Codes de type de séance attendus côté backend (catalogue global).
@@ -29,18 +34,27 @@ TYPES_ATTENDUS = ["REPRISE", "TECHNIQUE", "INTENSIF", "PRE_MATCH", "MATCH"]
 
 @dataclass
 class BootstrapContext:
+    """Tout le nécessaire pour pousser les données d'UNE équipe d'un club de démo."""
     base_url: str
     club_id: str
     equipe_id: str
-    president: ApiClient
-    workers: dict[str, ApiClient]                 # cle worker → client
+    equipe_nom: str
+    profil: ProfilClub
+    president: ApiClient                            # président du club (contexte club+équipe)
+    workers: dict[str, ApiClient]                   # cle worker → client (scopé équipe)
     joueurs_clients: dict[str, ApiClient] = field(default_factory=dict)  # nom_complet → client JOUEUR
     type_seance_ids: dict[str, str] = field(default_factory=dict)        # code → id
     comptes_crees: list[tuple[str, str, str]] = field(default_factory=list)  # (role, email, mdp)
+    effectif: list[Joueur] = field(default_factory=list)
+    saison_sim: SaisonSimulee | None = None
+    saison_id: str | None = None
 
     def worker(self, cle_donnee: str) -> ApiClient:
         """Client autorisé à écrire le type de donnée demandé (cf. config.ROLE_POUR)."""
         return self.workers[config.ROLE_POUR[cle_donnee]]
+
+    def a_worker(self, cle_donnee: str) -> bool:
+        return config.ROLE_POUR.get(cle_donnee) in self.workers
 
 
 def _slug(s: str) -> str:
@@ -48,67 +62,172 @@ def _slug(s: str) -> str:
     return "".join(c for c in s.lower() if c.isalnum())
 
 
-def bootstrap(base_url: str, params, effectif: list[Joueur],
-              creer_effectif: bool = True) -> BootstrapContext:
-    """Met en place le tenant démo. Si creer_effectif est False (mode purge), on
-    s'arrête après les workers (pas de création de fiches ni de comptes joueurs)."""
-    # 1) Président + garde-fous.
-    president = ApiClient(base_url)
-    auth = president.login(config.PRESIDENT_EMAIL, config.PRESIDENT_PASSWORD)
-    if auth.get("role") != "PRESIDENT":
+# ═══════════════════════════════ Orchestration ═══════════════════════════════
+
+def login_admin(base_url: str, email: str | None, password: str | None) -> ApiClient:
+    """Connecte le SUPER_ADMIN pilote et vérifie son rôle (garde-fou)."""
+    if not email or not password:
         raise RuntimeError(
-            f"Compte {config.PRESIDENT_EMAIL} : rôle {auth.get('role')} (PRESIDENT attendu). "
-            "Le générateur refuse de tourner pour éviter d'écrire hors du tenant démo.")
-    club_id = auth.get("clubId")
-    if not club_id:
-        raise RuntimeError("Le président démo n'a pas de club rattaché — créez-le d'abord.")
+            "Identifiants super-admin manquants : passez --admin-email/--admin-password "
+            f"ou les variables d'env {config.ADMIN_EMAIL_ENV}/{config.ADMIN_PASSWORD_ENV}.")
+    admin = ApiClient(base_url)
+    auth = admin.login(email, password)
+    if auth.get("role") != "SUPER_ADMIN":
+        raise RuntimeError(
+            f"Compte {email} : rôle {auth.get('role')} (SUPER_ADMIN attendu). "
+            "Le générateur multi-club a besoin d'un super-admin pour créer clubs et packs.")
+    return admin
 
-    # 2) Équipe démo (idempotent).
-    mon_club = president.get("/api/mon-club")
-    equipe_id = _trouver_ou_creer_equipe(president, mon_club)
-    president.set_contexte(club_id=club_id, equipe_ids=[equipe_id])
 
+def preparer_clubs(admin: ApiClient, base_url: str, params, log=print) -> list[BootstrapContext]:
+    """Met en place les 3 clubs (idempotent) et renvoie un contexte par équipe, saison simulée incluse.
+
+    IMPORTANT : toute l'ORCHESTRATION passe par le SUPER_ADMIN (bypass des permissions). Le président
+    créé à la création du club n'a PAS d'affectation RBAC → aucune permission ; il ne sert donc que de
+    login démo. Les WORKERS, eux, reçoivent leur affectation via /mon-club/membres et portent les
+    droits d'écriture des données."""
+    types: dict[str, str] | None = None
+    contexts: list[BootstrapContext] = []
+
+    for pi, profil in enumerate(config.PROFILS):
+        log(f"\n=== Club « {profil.nom} » (pack {profil.pack}, {profil.nb_equipes} équipe(s)) ===")
+        club_id = _creer_ou_trouver_club(admin, profil, log)
+        _assigner_pack(admin, club_id, profil.pack, log)
+
+        # Le super-admin agit DANS le club via le contexte (X-Contexte-Club).
+        admin.set_contexte(club_id=club_id)
+
+        if types is None:
+            types = _charger_types_seance(admin)  # catalogue global, lu avec un club actif
+
+        if profil.role_custom:
+            _creer_role_custom(admin, club_id, profil, log)
+
+        ctx_club: list[BootstrapContext] = []
+        for idx in range(profil.nb_equipes):
+            equipe_nom = config.EQUIPE_NOMS[idx] if idx < len(config.EQUIPE_NOMS) else f"Équipe {idx + 1}"
+            equipe_cat = config.EQUIPE_CATEGORIES[idx] if idx < len(config.EQUIPE_CATEGORIES) else "Senior"
+            equipe_id = _creer_ou_trouver_equipe(admin, club_id, equipe_nom, equipe_cat)
+            log(f"  • {equipe_nom} ({equipe_id[:8]}…)")
+
+            params_eq = dataclasses.replace(
+                params, nb_joueurs=profil.nb_joueurs, intensite=profil.intensite,
+                seed=params.seed + 1000 * (pi + 1) + idx)
+            saison = simuler(params_eq)
+
+            ctx = _preparer_equipe(base_url, admin, club_id, equipe_id, equipe_nom,
+                                   profil, params_eq, types, saison.effectif, log)
+            ctx.saison_sim = saison
+            ctx_club.append(ctx)
+            contexts.append(ctx)
+
+        # Saison au niveau CLUB (une seule EN_COURS), puis périodes + effectif par équipe.
+        saison_id = _assurer_saison(admin, ctx_club[0], params, log)
+        for ctx in ctx_club:
+            ctx.saison_id = saison_id
+            _definir_periodes_effectif(admin, ctx, saison_id, log)
+
+    return contexts
+
+
+# ═══════════════════════════════ Étapes ═══════════════════════════════
+
+def _creer_ou_trouver_club(admin: ApiClient, profil: ProfilClub, log) -> str:
+    for c in admin.get("/api/clubs") or []:
+        if c.get("nom") == profil.nom:
+            return c["id"]
+    cree = admin.post("/api/clubs", json={
+        "nom": profil.nom,
+        "president": {
+            "email": profil.president_email,
+            "nom": profil.president_nom,
+            "prenom": profil.president_prenom,
+            "motDePasse": config.PRESIDENT_DEMO_PASSWORD,
+        },
+    })
+    log(f"  club créé (président {profil.president_email})")
+    return cree["id"]
+
+
+def _assigner_pack(admin: ApiClient, club_id: str, pack: str, log) -> None:
+    admin.put(f"/api/admin/clubs/{club_id}/pack", json={"packCode": pack})
+    log(f"  pack « {pack} » assigné")
+
+
+def _creer_role_custom(admin: ApiClient, club_id: str, profil: ProfilClub, log) -> str | None:
+    """Crée le rôle custom du club (idempotent par libellé). Best-effort (super-admin, contexte club)."""
+    admin.set_contexte(club_id=club_id)
+    try:
+        for r in admin.get("/api/roles") or []:
+            if r.get("libelle") == profil.role_custom and not r.get("systeme"):
+                return r["id"]
+        cree = admin.post("/api/roles", json={
+            "libelle": profil.role_custom,
+            "permissions": list(config.ROLE_CUSTOM_ADJOINT_PERMS),
+        })
+        log(f"  rôle custom « {profil.role_custom} » créé")
+        return cree.get("id")
+    except ApiError as e:
+        log(f"  (rôle custom ignoré : {e.statut})")
+        return None
+
+
+def _creer_ou_trouver_equipe(admin: ApiClient, club_id: str, nom: str, categorie: str) -> str:
+    admin.set_contexte(club_id=club_id)
+    mon_club = admin.get("/api/mon-club")
+    for e in mon_club.get("equipes", []):
+        if e["nom"] == nom:
+            return e["id"]
+    cree = admin.post("/api/mon-club/equipes", json={"nom": nom, "categorie": categorie})
+    return cree["id"]
+
+
+def _preparer_equipe(base_url, admin, club_id, equipe_id, equipe_nom, profil,
+                     params, types, effectif: list[Joueur], log) -> BootstrapContext:
     ctx = BootstrapContext(
-        base_url=base_url, club_id=club_id, equipe_id=equipe_id,
-        president=president, workers={},
+        base_url=base_url, club_id=club_id, equipe_id=equipe_id, equipe_nom=equipe_nom,
+        profil=profil, president=admin, workers={}, type_seance_ids=types, effectif=effectif,
     )
 
-    # 3) Catalogue des types de séance.
-    ctx.type_seance_ids = _charger_types_seance(president)
+    # Création des membres pilotée par le super-admin, DANS le contexte du club.
+    admin.set_contexte(club_id=club_id)
 
-    # 4) Workers (idempotent) + connexion.
-    membres = {m["email"].lower(): m for m in president.get("/api/mon-club/membres")}
+    # Workers scopés à l'équipe (medical seulement si le club a le module médical). Ils reçoivent
+    # leur affectation RBAC via /mon-club/membres → ce sont eux qui écriront les données.
+    membres = {m["email"].lower(): m for m in admin.get("/api/mon-club/membres")}
     for w in config.WORKERS:
-        _assurer_membre(president, membres, ctx,
-                        email=w.email, role=w.role, prenom=w.prenom, nom=w.nom,
-                        mdp=config.WORKER_PASSWORD, equipe_id=equipe_id, joueur_id=None)
+        if w.cle == "medical" and not profil.medical:
+            continue
+        email = f"{_prefixe_worker(w.email)}.{profil.cle}{_suffixe_equipe(equipe_nom)}@{config.WORKER_EMAIL_DOMAIN}"
+        _assurer_membre(admin, membres, ctx, email=email, role=w.role,
+                        prenom=w.prenom, nom=w.nom, mdp=config.WORKER_PASSWORD,
+                        equipe_id=equipe_id, joueur_id=None)
         client = ApiClient(base_url)
-        client.login(w.email, config.WORKER_PASSWORD)
+        client.login(email, config.WORKER_PASSWORD)
         client.set_contexte(club_id=club_id, equipe_ids=[equipe_id])
         ctx.workers[w.cle] = client
 
-    if not creer_effectif:
-        return ctx
-
-    # 5) Fiches joueurs (par le préparateur) — idempotent par (nom, prenom).
+    # Fiches joueurs (par le préparateur) — idempotent par (nom, prénom) DANS l'équipe.
     prepa = ctx.workers["preparateur"]
-    existants = {(j["nom"], j["prenom"]): j["id"] for j in prepa.get("/api/joueurs/tous")}
+    existants = {(j["nom"], j["prenom"]): j["id"]
+                 for j in (prepa.get("/api/joueurs/tous") or [])
+                 if j.get("equipeId") == equipe_id}
     for j in effectif:
         cle = (j.nom, j.prenom)
         if cle in existants:
             j.backend_id = existants[cle]
         else:
-            cree = prepa.post("/api/joueurs", json=_payload_joueur(j, params))
-            j.backend_id = cree["id"]
+            j.backend_id = prepa.post("/api/joueurs", json=_payload_joueur(j, params))["id"]
 
-    # 6) Comptes JOUEUR (par le président) + connexion de chacun.
-    membres = {m["email"].lower(): m for m in president.get("/api/mon-club/membres")}
-    for idx, j in enumerate(effectif, start=1):
-        email = f"j{idx}.{_slug(j.nom)}@{config.JOUEUR_EMAIL_DOMAIN}"
+    # Comptes JOUEUR (par le super-admin, contexte club) + connexion de chacun.
+    admin.set_contexte(club_id=club_id)
+    membres = {m["email"].lower(): m for m in admin.get("/api/mon-club/membres")}
+    for n, j in enumerate(effectif, start=1):
+        email = f"{profil.cle}{_suffixe_equipe(equipe_nom)}.j{n}.{_slug(j.nom)}@{config.JOUEUR_EMAIL_DOMAIN}"
         j.compte_email = email
-        _assurer_membre(president, membres, ctx,
-                        email=email, role="JOUEUR", prenom=j.prenom, nom=j.nom,
-                        mdp=config.JOUEUR_PASSWORD, equipe_id=equipe_id, joueur_id=j.backend_id)
+        _assurer_membre(admin, membres, ctx, email=email, role="JOUEUR",
+                        prenom=j.prenom, nom=j.nom, mdp=config.JOUEUR_PASSWORD,
+                        equipe_id=equipe_id, joueur_id=j.backend_id)
         client = ApiClient(base_url)
         client.login(email, config.JOUEUR_PASSWORD)
         ctx.joueurs_clients[j.nom_complet] = client
@@ -116,19 +235,48 @@ def bootstrap(base_url: str, params, effectif: list[Joueur],
     return ctx
 
 
-# ─────────────────────────── Helpers ───────────────────────────
-
-def _trouver_ou_creer_equipe(president: ApiClient, mon_club: dict) -> str:
-    for e in mon_club.get("equipes", []):
-        if e["nom"] == config.EQUIPE_NOM:
-            return e["id"]
-    cree = president.post("/api/mon-club/equipes",
-                          json={"nom": config.EQUIPE_NOM, "categorie": config.EQUIPE_CATEGORIE})
+def _assurer_saison(admin: ApiClient, ctx: BootstrapContext, params, log) -> str:
+    """Saison EN_COURS du club (une seule) : réutilisée si déjà présente, sinon ouverte (super-admin)."""
+    admin.set_contexte(club_id=ctx.club_id, equipe_ids=[ctx.equipe_id])
+    for s in admin.get("/api/saisons") or []:
+        if s.get("statut") == "EN_COURS":
+            return s["id"]
+    cree = admin.post("/api/saisons", json={
+        "libelle": f"Saison {params.annee_libelle()}",
+        "dateDebut": params.debut_saison.isoformat(),
+        "dateFin": (params.debut_saison.replace(year=params.debut_saison.year + 1)).isoformat(),
+        "statut": "EN_COURS",
+        "genererPeriodes": True,
+    })
+    log(f"  saison {params.annee_libelle()} ouverte")
     return cree["id"]
 
 
-def _charger_types_seance(president: ApiClient) -> dict[str, str]:
-    types = {t["code"]: t["id"] for t in president.get("/api/type-seances")}
+def _definir_periodes_effectif(admin: ApiClient, ctx: BootstrapContext, saison_id: str, log) -> None:
+    """Périodes par défaut + effectif de l'équipe dans la saison (idempotent, super-admin par équipe)."""
+    admin.set_contexte(club_id=ctx.club_id, equipe_ids=[ctx.equipe_id])
+    try:
+        admin.post(f"/api/saisons/{saison_id}/periodes/defaut")
+    except ApiError:
+        pass  # déjà générées
+    ids = [j.backend_id for j in ctx.effectif if j.backend_id]
+    admin.put(f"/api/saisons/{saison_id}/effectif", json={"joueurIds": ids})
+
+
+# ─────────────────────────── Helpers ───────────────────────────
+
+def _prefixe_worker(email: str) -> str:
+    """« prepa@staff… » → « prepa » (préfixe court réutilisé pour l'email par équipe)."""
+    return email.split("@", 1)[0]
+
+
+def _suffixe_equipe(equipe_nom: str) -> str:
+    """Suffixe d'unicité par équipe (ex. « Équipe Réserve » → « reserve »)."""
+    return _slug(equipe_nom.replace("Équipe", "")) or "e"
+
+
+def _charger_types_seance(admin: ApiClient) -> dict[str, str]:
+    types = {t["code"]: t["id"] for t in admin.get("/api/type-seances")}
     manquants = [c for c in TYPES_ATTENDUS if c not in types]
     if manquants:
         raise RuntimeError(f"Types de séance manquants côté backend : {manquants}")
