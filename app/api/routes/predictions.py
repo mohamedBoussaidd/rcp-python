@@ -178,22 +178,22 @@ def _contexte_joueur(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> dict:
 
     try:
         with conn.cursor() as cur:
-            # Saison au niveau CLUB (V37) : on remonte le club via l'équipe du joueur.
-            # Saison EN_COURS du club (le cas échéant) + le club a-t-il des saisons ?
+            # Saison au niveau CLUB (V37) : le club est porté directement par la fiche (j.club_id,
+            # Phase 4 — plus de cache j.equipe_id). L'équipe COURANTE du joueur (pour la période)
+            # est dérivée de son effectif dans la saison EN_COURS (effectif_saison).
             cur.execute("""
                 SELECT
-                  j.equipe_id AS equipe_id,
+                  (SELECT es.equipe_id FROM effectif_saison es
+                     JOIN saison s ON s.id = es.saison_id AND s.statut = 'EN_COURS'
+                     WHERE es.joueur_id = j.id
+                     ORDER BY es.date_entree DESC NULLS LAST LIMIT 1) AS equipe_id,
                   (SELECT s.date_debut FROM saison s
-                     JOIN equipe e ON e.club_id = s.club_id
-                     WHERE e.id = j.equipe_id AND s.statut = 'EN_COURS'
+                     WHERE s.club_id = j.club_id AND s.statut = 'EN_COURS'
                      ORDER BY s.date_debut DESC LIMIT 1) AS encours_debut,
                   (SELECT s.id FROM saison s
-                     JOIN equipe e ON e.club_id = s.club_id
-                     WHERE e.id = j.equipe_id AND s.statut = 'EN_COURS'
+                     WHERE s.club_id = j.club_id AND s.statut = 'EN_COURS'
                      ORDER BY s.date_debut DESC LIMIT 1) AS encours_id,
-                  EXISTS (SELECT 1 FROM saison s
-                     JOIN equipe e ON e.club_id = s.club_id
-                     WHERE e.id = j.equipe_id) AS a_saisons
+                  EXISTS (SELECT 1 FROM saison s WHERE s.club_id = j.club_id) AS a_saisons
                 FROM joueur j WHERE j.id = %s
             """, (str(joueur_id),))
             row = cur.fetchone()
@@ -812,17 +812,17 @@ def _signal_wellness(joueur_id: UUID, cfg: dict, conn) -> tuple:
         return 0, None
 
     sommeil, fatigue_i, douleur, stress, humeur = (int(v) for v in row)
-    # Échelle de saisie : 1 = excellent → 5 = très mauvais pour TOUS les items.
+    # Échelle de saisie : 1 = excellent → 10 = très mauvais pour TOUS les items.
     # Composite bien-être 0..100 (plus haut = mieux) : on inverse les 5 items.
-    composite = round(((6 - sommeil) + (6 - humeur) + (6 - fatigue_i) + (6 - douleur) + (6 - stress)) / 5 * 20)
+    composite = round(((11 - sommeil) + (11 - humeur) + (11 - fatigue_i) + (11 - douleur) + (11 - stress)) / 5 * 10)
 
-    # Items dégradés à signaler (haut = mauvais pour fatigue/douleur/stress ; bas = mauvais pour sommeil/humeur).
+    # Items dégradés à signaler (convention uniforme : haut = mauvais pour les 5 items).
     soucis = []
-    if fatigue_i >= 4: soucis.append("fatigue élevée")
-    if douleur >= 4:   soucis.append("courbatures")
-    if stress >= 4:    soucis.append("stress")
-    if sommeil <= 2:   soucis.append("sommeil dégradé")
-    if humeur <= 2:    soucis.append("humeur basse")
+    if fatigue_i >= 8: soucis.append("fatigue élevée")
+    if douleur >= 8:   soucis.append("courbatures")
+    if stress >= 8:    soucis.append("stress")
+    if sommeil >= 8:   soucis.append("sommeil dégradé")
+    if humeur >= 8:    soucis.append("humeur basse")
     detail = (" — " + ", ".join(soucis)) if soucis else ""
 
     seuil_alerte    = cfg.get("seuil_wellness_alerte",    40)
@@ -1063,8 +1063,8 @@ def _readiness_joueur(joueur_id: UUID, conn) -> tuple:
         return None, None
 
     sommeil, fatigue_i, douleur, stress, humeur = (int(v) for v in row[:5])
-    # Tous les items 1=excellent..5=très mauvais → inversés pour « plus haut = mieux ».
-    composite = round(((6 - sommeil) + (6 - humeur) + (6 - fatigue_i) + (6 - douleur) + (6 - stress)) / 5 * 20)
+    # Tous les items 1=excellent..10=très mauvais → inversés pour « plus haut = mieux ».
+    composite = round(((11 - sommeil) + (11 - humeur) + (11 - fatigue_i) + (11 - douleur) + (11 - stress)) / 5 * 10)
     return composite, str(row[5])
 
 
@@ -1843,7 +1843,10 @@ def _joueurs_resume(conn, scope=None):
         with conn.cursor() as cur:
             extra = ""; params: list = []
             if scope:
-                extra = " AND j.equipe_id = ANY(%s)"; params.append(scope)
+                # Scope par l'équipe d'EFFECTIF (es.equipe_id), pas le cache j.equipe_id :
+                # gère le multi-équipe et n'exclut jamais un joueur au cache périmé. Le JOIN
+                # sur effectif_saison écarte nativement les fiches staff (aucun effectif).
+                extra = " AND es.equipe_id = ANY(%s)"; params.append(scope)
             cur.execute(f"""
                 SELECT j.id, j.nom, j.prenom, j.poste_principal
                 FROM joueur j
@@ -1859,15 +1862,13 @@ def _joueurs_resume(conn, scope=None):
     except Exception:
         try: conn.rollback()
         except Exception: pass
-    # Repli legacy
+    # Repli legacy (aucun effectif renseigné) : la colonne joueur.equipe_id n'existe plus (V51),
+    # on ne peut plus scoper par équipe ici → tous les joueurs actifs (chemin pré-effectif only).
     with conn.cursor() as cur:
-        extra = ""; params = []
-        if scope:
-            extra = " AND equipe_id = ANY(%s)"; params.append(scope)
-        cur.execute(f"""
+        cur.execute("""
             SELECT id, nom, prenom, poste_principal
-            FROM joueur WHERE statut != 'inactif'{extra} ORDER BY nom, prenom
-        """, params)
+            FROM joueur WHERE statut != 'inactif' ORDER BY nom, prenom
+        """)
         return cur.fetchall()
 
 

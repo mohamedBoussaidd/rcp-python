@@ -47,7 +47,7 @@ class GpsMesure:
 class WellnessSaisie:
     joueur: Joueur
     date: date
-    sommeil: int       # 1=bon .. 5=mauvais (convention uniforme)
+    sommeil: int       # 1=bon .. 10=mauvais (convention uniforme)
     fatigue: int
     douleur: int       # courbatures
     stress: int
@@ -130,7 +130,9 @@ _IMC_PLAFOND = 24.8            # garde-fou : aucun joueur affiché en surpoids
 
 
 def _clamp_hooper(x: float) -> int:
-    return int(max(1, min(5, round(x))))
+    # Le moteur causal raisonne sur un continuum 1..5 ; la note app est sur 1..10
+    # (convention : 1 = bon → 10 = mauvais), d'où la conversion ×2 au clamp.
+    return int(max(1, min(10, round(x * 2))))
 
 
 class _EtatJoueur:
@@ -342,7 +344,8 @@ def _generer_wellness(joueur, jour, etat, blesse, rng) -> WellnessSaisie | None:
     doms = etat.courbatures                                           # 0..1
     fatigue_idx = float(np.clip((etat.acwr - 0.7) / 1.3, 0.0, 1.0))   # 0..1
 
-    # 1=bon .. 5=mauvais. Base bonne (~2), dégradée par DOMS et fatigue de fond.
+    # Continuum interne 1=bon .. 5=mauvais (note finale /10 via _clamp_hooper).
+    # Base bonne (~2), dégradée par DOMS et fatigue de fond.
     # La douleur (courbatures) suit surtout le DOMS → grosse séance la veille = douleur ↑.
     douleur = _clamp_hooper(rng.normal(1.6 + 2.8 * doms + 0.5 * fatigue_idx, 0.55))
     fatigue = _clamp_hooper(rng.normal(1.8 + 1.8 * doms + 1.4 * fatigue_idx, 0.55))
@@ -352,7 +355,7 @@ def _generer_wellness(joueur, jour, etat, blesse, rng) -> WellnessSaisie | None:
 
     # Gêne ponctuelle si courbatures fortes (signal pré-blessure éventuel).
     gene_zone = gene_int = None
-    if douleur >= 4 and rng.random() < 0.25:
+    if douleur >= 8 and rng.random() < 0.25:
         gene_zone = rng.choice(["Cuisse", "Mollet", "Genou", "Cheville", "Dos"])
         gene_int = _clamp_hooper(rng.normal(3.0, 0.7))
 
