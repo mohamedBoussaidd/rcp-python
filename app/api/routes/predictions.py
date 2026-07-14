@@ -1837,7 +1837,9 @@ def _joueurs_resume(conn, scope=None):
     Périmètre du résumé d'équipe : l'effectif des saisons EN_COURS si la notion de
     saison/effectif existe ET est renseignée ; sinon repli LEGACY sur tous les joueurs
     actifs (non-breaking tant qu'aucune saison n'a été ouverte).
-    `scope` (liste d'equipe_id du contexte) restreint aux équipes ciblées.
+    `scope` (liste d'equipe_id du contexte) restreint aux équipes ciblées. Quand un
+    scope est transmis, il fait TOUJOURS foi : résultat scopé même vide (club neuf sans
+    effectif), jamais de repli plateforme entière.
     """
     try:
         with conn.cursor() as cur:
@@ -1857,13 +1859,18 @@ def _joueurs_resume(conn, scope=None):
                 ORDER BY j.nom, j.prenom
             """, params)
             rows = cur.fetchall()
+        if scope:
+            return rows
         if rows:
             return rows
     except Exception:
         try: conn.rollback()
         except Exception: pass
-    # Repli legacy (aucun effectif renseigné) : la colonne joueur.equipe_id n'existe plus (V51),
-    # on ne peut plus scoper par équipe ici → tous les joueurs actifs (chemin pré-effectif only).
+        if scope:
+            return []
+    # Repli legacy (AUCUN scope transmis et aucun effectif renseigné) : la colonne
+    # joueur.equipe_id n'existe plus (V51), on ne peut plus scoper par équipe ici
+    # → tous les joueurs actifs (chemin pré-effectif only).
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, nom, prenom, poste_principal
