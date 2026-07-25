@@ -1507,7 +1507,8 @@ def get_rapport_seance(seance_id: UUID):
                 cur.execute("""
                     SELECT s.id, s.date, ts.code, ts.libelle, s.type_seance_id,
                            s.objectif, s.objectif_distance_m, s.objectif_intensite,
-                           s.objectif_distance_haute_intensite_m
+                           s.objectif_distance_haute_intensite_m,
+                           s.duree_minutes, ts.duree_theorique_min
                     FROM seance s
                     JOIN type_seance ts ON ts.id = s.type_seance_id
                     WHERE s.id = %s
@@ -1527,9 +1528,10 @@ def get_rapport_seance(seance_id: UUID):
             objectif_intensite         = int(seance[7]) if seance[7] is not None else None
             objectif_distance_hi_m     = int(seance[8]) if seance[8] is not None else None
 
-            # Durée de référence de la séance = somme des durées des exercices
-            # (override seance_exercice sinon valeur de l'exercice). Sert au prorata
-            # de l'objectif d'équipe par joueur selon son temps de jeu réel.
+            # Durée de référence de la séance, pour proratiser l'objectif d'équipe par
+            # joueur selon son temps de jeu réel. Chaîne de repli (jamais nulle en pratique) :
+            # durée planifiée de la séance → somme du déroulé d'exercices →
+            # durée théorique du type → (dernier repli) max des durées réelles GPS (plus bas).
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT SUM(COALESCE(se.duree_minutes, e.duree_minutes))
@@ -1538,7 +1540,10 @@ def get_rapport_seance(seance_id: UUID):
                     WHERE se.seance_id = %s
                 """, (str(seance_id),))
                 ref_row = cur.fetchone()
-            duree_reference = float(ref_row[0]) if ref_row and ref_row[0] else None
+            duree_planifiee = float(seance[9])  if seance[9]  else None
+            duree_deroule   = float(ref_row[0]) if ref_row and ref_row[0] else None
+            duree_type      = float(seance[10]) if seance[10] else None
+            duree_reference = duree_planifiee or duree_deroule or duree_type
 
             with conn.cursor() as cur:
                 cur.execute("""
@@ -1552,10 +1557,16 @@ def get_rapport_seance(seance_id: UUID):
                 """, (str(seance_id),))
                 players = cur.fetchall()
 
+            # Dernier repli : sans déroulé ni durée planifiée (séance-coquille GPS ou match),
+            # on prend la plus longue durée réelle jouée (≈ un joueur ayant fait toute la séance).
+            if not duree_reference and players:
+                duree_reference = max((float(p[5]) for p in players if p[5]), default=None)
+
             sous_norme_pct = cfg.get("seuil_sous_norme_pct", 20.0)
             sur_norme_pct  = cfg.get("seuil_sur_norme_pct",  20.0)
             corr_pct_kg    = cfg.get("correction_surpoids_pct_par_kg",  2.0)
             corr_pct_max   = cfg.get("correction_surpoids_plafond_pct", 20.0)
+            recence_j      = int(cfg.get("baseline_recence_jours", 90))
 
             lignes = []
             for p in players:
@@ -1565,25 +1576,42 @@ def get_rapport_seance(seance_id: UUID):
                 duree_reelle  = float(p[5]) if p[5] is not None else None
                 poids_actuel, poids_cible = _poids_a_date(joueur_id, seance_date, conn)
 
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT AVG(sub.ratio) FROM (
-                            SELECT dg.distance_totale_m / NULLIF(dg.duree_minutes, 0) AS ratio
-                            FROM donnee_gps dg
-                            JOIN seance s ON dg.seance_id = s.id
-                            WHERE dg.joueur_id = %s
-                              AND s.type_seance_id = %s
-                              AND dg.seance_id != %s
-                              AND dg.duree_minutes > 0
-                              AND dg.distance_totale_m > 0
-                            ORDER BY s.date DESC
-                            LIMIT 10
-                        ) sub
-                    """, (str(joueur_id), str(type_seance_id), str(seance_id)))
-                    avg_row = cur.fetchone()
+                # Baseline personnelle = m/min moyen des 10 dernières séances RÉALISÉES (H.5) du
+                # même type, dans la fenêtre de récence (écarte une baseline trop ancienne, ex.
+                # d'avant une longue blessure). `_n` = taille réelle. La variante « toutes séances
+                # confondues » sert de repli affichable quand le type est trop mince.
+                def _baseline_rapport(meme_type: bool):
+                    filtre_type = "AND s.type_seance_id = %s" if meme_type else ""
+                    params = [str(joueur_id)]
+                    if meme_type:
+                        params.append(str(type_seance_id))
+                    params += [str(seance_id), seance_date]
+                    with conn.cursor() as cur:
+                        cur.execute(f"""
+                            SELECT AVG(sub.ratio), COUNT(*) FROM (
+                                SELECT dg.distance_totale_m / NULLIF(dg.duree_minutes, 0) AS ratio
+                                FROM donnee_gps dg
+                                JOIN seance s ON dg.seance_id = s.id
+                                WHERE dg.joueur_id = %s
+                                  {filtre_type}
+                                  AND dg.seance_id != %s
+                                  AND s.statut = 'REALISEE'
+                                  AND s.date >= %s::date - INTERVAL '{recence_j} days'
+                                  AND dg.duree_minutes > 0
+                                  AND dg.distance_totale_m > 0
+                                ORDER BY s.date DESC
+                                LIMIT 10
+                            ) sub
+                        """, params)
+                        r = cur.fetchone()
+                    ratio = float(r[0]) if r and r[0] is not None else None
+                    n     = int(r[1])   if r and r[1] else 0
+                    return ratio, n
 
-                avg_ratio    = float(avg_row[0]) if avg_row and avg_row[0] is not None else None
-                dist_attendue = round(avg_ratio * duree_reelle, 0) if avg_ratio and duree_reelle else None
+                avg_ratio,   baseline_n   = _baseline_rapport(True)
+                avg_ratio_g, baseline_n_g = _baseline_rapport(False)
+                dist_attendue   = round(avg_ratio   * duree_reelle, 0) if avg_ratio   and duree_reelle else None
+                dist_attendue_g = round(avg_ratio_g * duree_reelle, 0) if avg_ratio_g and duree_reelle else None
 
                 delta_m = delta_pct = None
                 statut  = "SANS_BASELINE"
@@ -1626,7 +1654,10 @@ def get_rapport_seance(seance_id: UUID):
                     "poste":                   p[3] or "",
                     "duree_minutes":           int(duree_reelle) if duree_reelle else None,
                     "distance_reelle":         dist_reelle,
-                    "distance_attendue":       dist_attendue,
+                    "distance_attendue":         dist_attendue,
+                    "baseline_n":                baseline_n,
+                    "distance_attendue_globale": dist_attendue_g,
+                    "baseline_n_globale":        baseline_n_g,
                     "ratio_reel":              round(dist_reelle / duree_reelle, 1) if dist_reelle and duree_reelle else None,
                     "delta_m":                 delta_m,
                     "delta_pct":               delta_pct,
@@ -1682,18 +1713,21 @@ def get_charge_equipe(debut: str | None = None, fin: str | None = None, types: s
             cfg = _load_config(conn)
             sous_seuil = cfg.get("seuil_sous_norme_pct", 20.0)
             sur_seuil  = cfg.get("seuil_sur_norme_pct",  20.0)
+            recence_j  = int(cfg.get("baseline_recence_jours", 90))
             scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
 
             # Historique des ratios par (joueur, type), du plus récent au plus ancien.
             # Baseline d'une séance = moyenne des 10 plus récentes du même type, HORS séance
             # courante (même logique que le rapport par séance, sans correction météo).
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     SELECT dg.joueur_id, s.type_seance_id, dg.seance_id,
                            dg.distance_totale_m / NULLIF(dg.duree_minutes, 0) AS ratio
                     FROM donnee_gps dg
                     JOIN seance s ON s.id = dg.seance_id
                     WHERE dg.duree_minutes > 0 AND dg.distance_totale_m > 0
+                      AND s.statut = 'REALISEE'
+                      AND s.date >= CURRENT_DATE - INTERVAL '{recence_j} days'
                     ORDER BY dg.joueur_id, s.type_seance_id, s.date DESC
                 """)
                 hist: dict = {}
@@ -1828,6 +1862,98 @@ def get_charge_equipe(debut: str | None = None, fin: str | None = None, types: s
         return {"seances": seances_out, "joueurs": joueurs_out}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/equipe/objectif-hebdo")
+def get_objectif_hebdo(x_contexte_equipes: str | None = Header(default=None),
+                       x_contexte_club: str | None = Header(default=None)):
+    """
+    Panneau « Objectif de la semaine » (semaine ISO en cours, lundi → aujourd'hui).
+    Par joueur de l'effectif : cumul de distance de la semaine, cible A.5 (« suggestion
+    intelligente »), objectif retenu (manuel d'équipe si défini, sinon la cible A.5) et atteinte.
+    L'objectif manuel n'est lu que si le contexte cible UNE seule équipe.
+    """
+    try:
+        with get_connection() as conn:
+            cfg   = _load_config(conn)
+            scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
+
+            objectif_m = None
+            if scope and len(scope) == 1:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT objectif_distance_m FROM objectif_hebdo WHERE equipe_id = %s",
+                                (scope[0],))
+                    row = cur.fetchone()
+                    objectif_m = int(row[0]) if row and row[0] is not None else None
+
+            # Cumul de distance de la semaine en cours (lundi → aujourd'hui), par joueur.
+            cwhere = ["s.date >= date_trunc('week', CURRENT_DATE)::date"]
+            cparams: list = []
+            if scope:
+                cwhere.append("s.equipe_id = ANY(%s)"); cparams.append(scope)
+            cumul: dict = {}
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT dg.joueur_id, SUM(dg.distance_totale_m)
+                    FROM donnee_gps dg JOIN seance s ON s.id = dg.seance_id
+                    WHERE {' AND '.join(cwhere)}
+                    GROUP BY dg.joueur_id
+                """, cparams)
+                for jid, tot in cur.fetchall():
+                    cumul[str(jid)] = float(tot or 0.0)
+
+            joueurs = []
+            somme_ideal = 0.0
+            nb_ideal = 0
+            for (jid, nom, prenom, poste) in _joueurs_resume(conn, scope):
+                jid = str(jid)
+                cible = _charge_cible(jid, cfg, conn)
+                cible_ideal_m = None
+                if cible.get("disponible") and cible.get("unite") == "km" and cible.get("cible_ideal") is not None:
+                    cible_ideal_m = round(cible["cible_ideal"] * 1000)
+                    somme_ideal += cible_ideal_m
+                    nb_ideal += 1
+                cum = round(cumul.get(jid, 0.0))
+                obj = objectif_m if objectif_m is not None else cible_ideal_m
+                atteint = (cum >= obj) if obj else None
+                reste   = max(0, obj - cum) if obj else None
+                joueurs.append({
+                    "joueur_id":     jid,
+                    "nom":           nom,
+                    "prenom":        prenom,
+                    "poste":         poste or "",
+                    "cumul_m":       cum,
+                    "cible_ideal_m": cible_ideal_m,
+                    "cible_min_m":   round(cible["cible_min"]   * 1000) if cible_ideal_m is not None and cible.get("cible_min")   is not None else None,
+                    "cible_haute_m": round(cible["cible_haute"] * 1000) if cible_ideal_m is not None and cible.get("cible_haute") is not None else None,
+                    "plafond_m":     round(cible["plafond"]     * 1000) if cible_ideal_m is not None and cible.get("plafond")     is not None else None,
+                    "objectif_m":    obj,
+                    "source":        "MANUEL" if objectif_m is not None else ("INTELLIGENT" if cible_ideal_m is not None else None),
+                    "atteint":       atteint,
+                    "reste_m":       reste,
+                })
+
+            concernes    = [j for j in joueurs if j["atteint"] is not None]
+            nb_concernes = len(concernes)
+            nb_atteint   = sum(1 for j in concernes if j["atteint"])
+            meilleur = None
+            avec_obj = [j for j in joueurs if j["objectif_m"]]
+            if avec_obj:
+                m = max(avec_obj, key=lambda j: j["cumul_m"])
+                meilleur = {"joueur_id": m["joueur_id"], "nom": m["nom"],
+                            "prenom": m["prenom"], "cumul_m": m["cumul_m"]}
+
+            return {
+                "objectif_distance_m":  objectif_m,
+                "suggestion_moyenne_m": round(somme_ideal / nb_ideal) if nb_ideal else None,
+                "multi_equipes":        bool(scope) and len(scope) > 1,
+                "nb_atteint":           nb_atteint,
+                "nb_concernes":         nb_concernes,
+                "meilleur":             meilleur,
+                "joueurs":              joueurs,
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
