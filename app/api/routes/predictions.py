@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Header
 from uuid import UUID
-from datetime import date as _date
+from datetime import date as _date, timedelta as _timedelta
 from app.core.database import get_connection
 from app.schemas.schemas import RisqueBlessure, NiveauFatigue, ResumeJoueur, ChargeCible
 from typing import List
@@ -506,25 +506,101 @@ def _calcul_score_risque(joueur_id: UUID, cfg: dict, conn, date_ref=None,
     }
 
 
-def _charge_cible(joueur_id: UUID, cfg: dict, conn) -> dict:
+def _moyenne_hebdo_gps(joueur_id: UUID, conn, lundi, cap: int) -> tuple | None:
     """
-    Recommandation de charge pour la semaine à venir, individualisée.
-    On part de la charge chronique hebdo (source unifiée GPS↔RPE) et on projette
-    une fourchette par les bornes ACWR : sûre [0.8 ; 1.3], idéale ~1.05.
-    Exprimée en km si GPS disponible, sinon en unités sRPE (repli).
-    Renvoie {disponible, source, unite, ...} — disponible=False si pas de base chronique.
+    Baseline STABLE de la charge cible : volume GPS des `cap` dernières semaines COMPLÈTES
+    (fenêtre [lundi − cap·7 j ; lundi[ — inclut la semaine passée, exclut la semaine en cours)
+    ET le nombre de semaines réellement présentes (diviseur adaptatif). Ancrée au lundi : figée
+    toute la semaine, recalculée chaque lundi (pas de dérive en cours de semaine). Volontairement
+    distincte de la fenêtre « chronique découplée » de l'ACWR risque, qui exclut les 7 derniers
+    jours et raterait un historique court.
+    Renvoie (somme_mètres, semaines_présentes) ou None si aucune donnée dans la fenêtre.
     """
-    charge = _charge_acwr_unifiee(joueur_id, cfg, conn)
-    chro   = charge["chronique"]
-    if chro is None or chro <= 0:
-        return {"disponible": False, "source": charge["source"], "unite": charge["unite"],
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT SUM(dg.distance_totale_m),
+                       COUNT(DISTINCT date_trunc('week', s.date))
+                FROM donnee_gps dg
+                JOIN seance s ON dg.seance_id = s.id
+                WHERE dg.joueur_id = %s
+                  AND s.date >= %s::date - INTERVAL '{int(cap) * 7} days'
+                  AND s.date <  %s::date
+            """, (str(joueur_id), lundi, lundi))
+            row = cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+    if not row or row[0] is None or float(row[0]) == 0 or not row[1]:
+        return None
+    return (float(row[0]), int(row[1]))
+
+
+def _moyenne_hebdo_rpe(joueur_id: UUID, conn, lundi, cap: int) -> tuple | None:
+    """Repli sRPE de `_moyenne_hebdo_gps` (même fenêtre calendaire) quand le GPS manque."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT SUM(charge),
+                       COUNT(DISTINCT date_trunc('week', date))
+                FROM rpe_seance
+                WHERE joueur_id = %s
+                  AND charge IS NOT NULL
+                  AND date >= %s::date - INTERVAL '{int(cap) * 7} days'
+                  AND date <  %s::date
+            """, (str(joueur_id), lundi, lundi))
+            row = cur.fetchone()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+    if not row or row[0] is None or float(row[0]) == 0 or not row[1]:
+        return None
+    return (float(row[0]), int(row[1]))
+
+
+def _charge_cible(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> dict:
+    """
+    Recommandation de charge pour la SEMAINE DE TRAVAIL en cours (lundi→dimanche), individualisée.
+    Baseline = moyenne hebdo des dernières semaines COMPLÈTES réellement présentes (diviseur
+    ADAPTATIF `min(cap, semaines présentes)`, plafonné à `cap`), ANCRÉE AU LUNDI : l'objectif est
+    figé toute la semaine et ne se recalcule que le lundi (pas de dérive en cours de semaine).
+    Projetée par les bornes ACWR : sûre [0.8 ; 1.3], idéale ~1.05. Exprimée en km si GPS, sinon
+    en unités sRPE (repli). Se fiabilise à partir de `cap` semaines ; en-deçà, estimation signalée.
+    Renvoie {disponible, source, unite, ...} — disponible=False si aucune base de charge.
+    """
+    ref     = date_ref or _date.today()
+    lundi   = ref - _timedelta(days=ref.weekday())   # lundi ISO de la semaine en cours
+    cap_gps = int(cfg.get("acwr_semaines_chronique", 4))
+    cap_rpe = 3
+
+    gps = _moyenne_hebdo_gps(joueur_id, conn, lundi, cap_gps)
+    if gps is not None:
+        somme_m, semaines = gps
+        source, unite, cap = "GPS", "km", cap_gps
+        chro = round((somme_m / min(cap, max(1, semaines))) / 1000, 1)
+    else:
+        rpe = _moyenne_hebdo_rpe(joueur_id, conn, lundi, cap_rpe)
+        if rpe is None:
+            return {"disponible": False, "source": None, "unite": None,
+                    "phrase": "Pas assez de données de charge pour recommander une cible."}
+        somme, semaines = rpe
+        source, unite, cap = "RPE", "sRPE", cap_rpe
+        chro = round(somme / min(cap, max(1, semaines)))
+
+    if chro <= 0:
+        return {"disponible": False, "source": source, "unite": unite,
                 "phrase": "Pas assez de données de charge pour recommander une cible."}
 
     acwr_min   = float(cfg.get("acwr_cible_min", 0.8))
     acwr_ideal = float(cfg.get("acwr_cible_ideal", 1.05))
     acwr_haute = float(cfg.get("acwr_cible_haute", 1.2))
     acwr_max   = float(cfg.get("acwr_cible_max", 1.3))
-    unite = charge["unite"]
     arr = (lambda v: round(v, 1)) if unite == "km" else (lambda v: round(v))
 
     cible_min   = arr(chro * acwr_min)
@@ -532,19 +608,25 @@ def _charge_cible(joueur_id: UUID, cfg: dict, conn) -> dict:
     cible_haute = arr(chro * acwr_haute)
     plafond     = arr(chro * acwr_max)
 
+    provisoire = semaines < cap
     phrase = (f"Charge cible semaine : {cible_min}–{cible_haute} {unite} "
               f"(idéal ~{cible_ideal}). Plafond à ne pas dépasser : {plafond} {unite}.")
+    if provisoire:
+        phrase += (f" Estimation provisoire — basée sur {semaines} semaine"
+                   f"{'s' if semaines > 1 else ''} de données (se fiabilise à {cap}).")
     return {
-        "disponible":  True,
-        "source":      charge["source"],
-        "unite":       unite,
-        "chronique":   chro,
-        "acwr_actuel": charge["acwr"],
-        "cible_min":   cible_min,
-        "cible_ideal": cible_ideal,
-        "cible_haute": cible_haute,
-        "plafond":     plafond,
-        "phrase":      phrase,
+        "disponible":        True,
+        "source":            source,
+        "unite":             unite,
+        "chronique":         chro,
+        "cible_min":         cible_min,
+        "cible_ideal":       cible_ideal,
+        "cible_haute":       cible_haute,
+        "plafond":           plafond,
+        "semaines":          semaines,
+        "semaines_requises": cap,
+        "provisoire":        provisoire,
+        "phrase":            phrase,
     }
 
 
@@ -1917,6 +1999,7 @@ def _objectif_hebdo_data(conn, cfg, scope) -> dict:
     joueurs = []
     somme_ideal = 0.0
     nb_ideal = 0
+    sem_dispo: list = []   # semaines de données réellement disponibles (fiabilité de la suggestion)
     for (jid, nom, prenom, poste) in _joueurs_resume(conn, scope):
         jid = str(jid)
         cible = _charge_cible(jid, cfg, conn)
@@ -1925,6 +2008,8 @@ def _objectif_hebdo_data(conn, cfg, scope) -> dict:
             cible_ideal_m = round(cible["cible_ideal"] * 1000)
             somme_ideal += cible_ideal_m
             nb_ideal += 1
+            if cible.get("semaines") is not None:
+                sem_dispo.append(cible["semaines"])
         cum = round(cumul.get(jid, 0.0))
         obj = objectif_m if objectif_m is not None else cible_ideal_m
         atteint = (cum >= obj) if obj else None
@@ -1958,6 +2043,8 @@ def _objectif_hebdo_data(conn, cfg, scope) -> dict:
     return {
         "objectif_distance_m":  objectif_m,
         "suggestion_moyenne_m": round(somme_ideal / nb_ideal) if nb_ideal else None,
+        "suggestion_semaines":  min(sem_dispo) if sem_dispo else None,
+        "suggestion_provisoire": bool(sem_dispo) and min(sem_dispo) < 4,
         "multi_equipes":        bool(scope) and len(scope) > 1,
         "nb_atteint":           nb_atteint,
         "nb_concernes":         nb_concernes,

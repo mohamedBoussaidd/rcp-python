@@ -33,6 +33,9 @@ class ChargeCible(BaseModel):
     cible_ideal: Optional[float] = None
     cible_haute: Optional[float] = None
     plafond: Optional[float] = None
+    semaines: Optional[int] = None            # semaines de données réellement disponibles
+    semaines_requises: Optional[int] = None   # seuil de fiabilité (fenêtre chronique)
+    provisoire: Optional[bool] = None         # True tant que semaines < semaines_requises
     phrase: str
 
 
