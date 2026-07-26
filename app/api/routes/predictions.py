@@ -1879,81 +1879,249 @@ def get_objectif_hebdo(x_contexte_equipes: str | None = Header(default=None),
         with get_connection() as conn:
             cfg   = _load_config(conn)
             scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
+            return _objectif_hebdo_data(conn, cfg, scope)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-            objectif_m = None
-            if scope and len(scope) == 1:
+
+def _objectif_hebdo_data(conn, cfg, scope) -> dict:
+    """
+    Cœur du panneau « Objectif de la semaine » (extrait pour être réutilisé par la carte briefing
+    sans repasser par la couche HTTP). Par joueur : cumul de la semaine en cours, cible A.5,
+    objectif retenu (manuel d'équipe si défini et scope = 1 équipe, sinon cible A.5) et atteinte.
+    """
+    objectif_m = None
+    if scope and len(scope) == 1:
+        with conn.cursor() as cur:
+            cur.execute("SELECT objectif_distance_m FROM objectif_hebdo WHERE equipe_id = %s",
+                        (scope[0],))
+            row = cur.fetchone()
+            objectif_m = int(row[0]) if row and row[0] is not None else None
+
+    # Cumul de distance de la semaine en cours (lundi → aujourd'hui), par joueur.
+    cwhere = ["s.date >= date_trunc('week', CURRENT_DATE)::date"]
+    cparams: list = []
+    if scope:
+        cwhere.append("s.equipe_id = ANY(%s)"); cparams.append(scope)
+    cumul: dict = {}
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT dg.joueur_id, SUM(dg.distance_totale_m)
+            FROM donnee_gps dg JOIN seance s ON s.id = dg.seance_id
+            WHERE {' AND '.join(cwhere)}
+            GROUP BY dg.joueur_id
+        """, cparams)
+        for jid, tot in cur.fetchall():
+            cumul[str(jid)] = float(tot or 0.0)
+
+    joueurs = []
+    somme_ideal = 0.0
+    nb_ideal = 0
+    for (jid, nom, prenom, poste) in _joueurs_resume(conn, scope):
+        jid = str(jid)
+        cible = _charge_cible(jid, cfg, conn)
+        cible_ideal_m = None
+        if cible.get("disponible") and cible.get("unite") == "km" and cible.get("cible_ideal") is not None:
+            cible_ideal_m = round(cible["cible_ideal"] * 1000)
+            somme_ideal += cible_ideal_m
+            nb_ideal += 1
+        cum = round(cumul.get(jid, 0.0))
+        obj = objectif_m if objectif_m is not None else cible_ideal_m
+        atteint = (cum >= obj) if obj else None
+        reste   = max(0, obj - cum) if obj else None
+        joueurs.append({
+            "joueur_id":     jid,
+            "nom":           nom,
+            "prenom":        prenom,
+            "poste":         poste or "",
+            "cumul_m":       cum,
+            "cible_ideal_m": cible_ideal_m,
+            "cible_min_m":   round(cible["cible_min"]   * 1000) if cible_ideal_m is not None and cible.get("cible_min")   is not None else None,
+            "cible_haute_m": round(cible["cible_haute"] * 1000) if cible_ideal_m is not None and cible.get("cible_haute") is not None else None,
+            "plafond_m":     round(cible["plafond"]     * 1000) if cible_ideal_m is not None and cible.get("plafond")     is not None else None,
+            "objectif_m":    obj,
+            "source":        "MANUEL" if objectif_m is not None else ("INTELLIGENT" if cible_ideal_m is not None else None),
+            "atteint":       atteint,
+            "reste_m":       reste,
+        })
+
+    concernes    = [j for j in joueurs if j["atteint"] is not None]
+    nb_concernes = len(concernes)
+    nb_atteint   = sum(1 for j in concernes if j["atteint"])
+    meilleur = None
+    avec_obj = [j for j in joueurs if j["objectif_m"]]
+    if avec_obj:
+        m = max(avec_obj, key=lambda j: j["cumul_m"])
+        meilleur = {"joueur_id": m["joueur_id"], "nom": m["nom"],
+                    "prenom": m["prenom"], "cumul_m": m["cumul_m"]}
+
+    return {
+        "objectif_distance_m":  objectif_m,
+        "suggestion_moyenne_m": round(somme_ideal / nb_ideal) if nb_ideal else None,
+        "multi_equipes":        bool(scope) and len(scope) > 1,
+        "nb_atteint":           nb_atteint,
+        "nb_concernes":         nb_concernes,
+        "meilleur":             meilleur,
+        "joueurs":              joueurs,
+    }
+
+
+@router.get("/equipe/briefing")
+def get_briefing(x_contexte_equipes: str | None = Header(default=None),
+                 x_contexte_club: str | None = Header(default=None)):
+    """
+    Bundle d'INDICATEURS COMPACTS pour la carte « briefing » du préparateur.
+    N'est JAMAIS envoyé tel quel au front : consommé par le back Java qui le met en mots (LLM) ou
+    remplit un gabarit. Dérivé du panneau objectif hebdo (cumul de la semaine vs cible ACWR par
+    joueur) → atteinte de l'objectif + joueurs en surcharge (cumul > plafond) / sous-charge
+    (cumul < cible mini). Aucune donnée brute, uniquement des chiffres agrégés.
+    """
+    try:
+        with get_connection() as conn:
+            cfg   = _load_config(conn)
+            scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
+            oh    = _objectif_hebdo_data(conn, cfg, scope)
+
+        joueurs = oh["joueurs"]
+
+        def _nom(j):
+            return f'{(j.get("prenom") or "").strip()} {(j.get("nom") or "").strip()}'.strip()
+
+        surcharge, souscharge = [], []
+        for j in joueurs:
+            cum, plaf, cmin = j.get("cumul_m"), j.get("plafond_m"), j.get("cible_min_m")
+            if plaf is not None and cum is not None and cum > plaf:
+                surcharge.append({"nom": _nom(j), "cumul_m": cum, "plafond_m": plaf})
+            elif cmin is not None and cum is not None and cum < cmin:
+                souscharge.append({"nom": _nom(j), "cumul_m": cum, "cible_min_m": cmin})
+        surcharge.sort(key=lambda x: x["cumul_m"] - x["plafond_m"], reverse=True)
+        souscharge.sort(key=lambda x: x["cible_min_m"] - x["cumul_m"], reverse=True)
+
+        restes = [j["reste_m"] for j in joueurs if j.get("reste_m")]
+        reste_moyen = round(sum(restes) / len(restes)) if restes else None
+
+        source = ("MANUEL" if oh["objectif_distance_m"] is not None
+                  else ("INTELLIGENT" if oh["suggestion_moyenne_m"] is not None else None))
+
+        return {
+            "multi_equipes": oh["multi_equipes"],
+            "effectif": {"nb_joueurs": len(joueurs)},
+            "objectif_hebdo": {
+                "source":               source,
+                "objectif_manuel_m":    oh["objectif_distance_m"],
+                "suggestion_moyenne_m": oh["suggestion_moyenne_m"],
+                "nb_atteint":           oh["nb_atteint"],
+                "nb_concernes":         oh["nb_concernes"],
+                "reste_moyen_m":        reste_moyen,
+                "meilleur":             oh["meilleur"],
+            },
+            "charge_semaine": {
+                "nb_surcharge":  len(surcharge),
+                "nb_souscharge": len(souscharge),
+                "surcharge":     surcharge[:3],
+                "souscharge":    souscharge[:3],
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/equipe/derives")
+def get_derives(x_contexte_equipes: str | None = Header(default=None),
+                x_contexte_club: str | None = Header(default=None)):
+    """
+    Dérives lentes de l'effectif sur ~4 semaines, en TROIS axes séparés (pour une lecture globale
+    de chacun) : volume (distance totale), charge haute intensité (distance ≥ 19 km/h) et ressenti
+    (fatigue subjective composite). Par axe et par joueur : comparaison de la moyenne des 14 derniers
+    jours vs les 14 précédents → dérive en hausse / en baisse au-delà d'un seuil. Indicateurs déjà
+    agrégés (jamais de données brutes au LLM), consommés par la carte web/PWA et le debrief textuel.
+    """
+    SEUIL = 20.0   # % de variation à partir duquel on parle de dérive
+    try:
+        with get_connection() as conn:
+            scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
+            roster = _joueurs_resume(conn, scope)
+            noms = {str(jid): f'{(prenom or "").strip()} {(nom or "").strip()}'.strip()
+                    for (jid, nom, prenom, poste) in roster}
+            ids = list(noms.keys())
+
+            gps = {}   # jid -> (vol_recent, vol_ref, hi_recent, hi_ref)
+            well = {}  # jid -> (w_recent, w_ref)  (composite, haut = plus de fatigue)
+            if ids:
+                gwhere = ["s.statut = 'REALISEE'", "s.date >= CURRENT_DATE - INTERVAL '28 days'",
+                          "dg.joueur_id = ANY(%s)"]
+                gparams: list = [ids]
+                if scope:
+                    gwhere.append("s.equipe_id = ANY(%s)"); gparams.append(scope)
                 with conn.cursor() as cur:
-                    cur.execute("SELECT objectif_distance_m FROM objectif_hebdo WHERE equipe_id = %s",
-                                (scope[0],))
-                    row = cur.fetchone()
-                    objectif_m = int(row[0]) if row and row[0] is not None else None
+                    cur.execute(f"""
+                        SELECT dg.joueur_id,
+                          SUM(CASE WHEN s.date >= CURRENT_DATE - INTERVAL '14 days' THEN dg.distance_totale_m ELSE 0 END),
+                          SUM(CASE WHEN s.date <  CURRENT_DATE - INTERVAL '14 days' THEN dg.distance_totale_m ELSE 0 END),
+                          SUM(CASE WHEN s.date >= CURRENT_DATE - INTERVAL '14 days' THEN COALESCE(dg.distance_19kmh_m,0) ELSE 0 END),
+                          SUM(CASE WHEN s.date <  CURRENT_DATE - INTERVAL '14 days' THEN COALESCE(dg.distance_19kmh_m,0) ELSE 0 END)
+                        FROM donnee_gps dg JOIN seance s ON s.id = dg.seance_id
+                        WHERE {' AND '.join(gwhere)}
+                        GROUP BY dg.joueur_id
+                    """, gparams)
+                    for jid, vr, vf, hr, hf in cur.fetchall():
+                        gps[str(jid)] = (float(vr or 0), float(vf or 0), float(hr or 0), float(hf or 0))
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT joueur_id,
+                          AVG(CASE WHEN date >= CURRENT_DATE - INTERVAL '14 days' THEN comp END),
+                          AVG(CASE WHEN date <  CURRENT_DATE - INTERVAL '14 days' THEN comp END)
+                        FROM (
+                          SELECT joueur_id, date,
+                                 ((11-sommeil)+(11-humeur)+(11-fatigue)+(11-douleur)+(11-stress))/5.0*10 AS comp
+                          FROM wellness_quotidien
+                          WHERE date >= CURRENT_DATE - INTERVAL '28 days' AND joueur_id = ANY(%s)
+                        ) w
+                        GROUP BY joueur_id
+                    """, (ids,))
+                    for jid, wr, wf in cur.fetchall():
+                        well[str(jid)] = (float(wr) if wr is not None else None,
+                                          float(wf) if wf is not None else None)
 
-            # Cumul de distance de la semaine en cours (lundi → aujourd'hui), par joueur.
-            cwhere = ["s.date >= date_trunc('week', CURRENT_DATE)::date"]
-            cparams: list = []
-            if scope:
-                cwhere.append("s.equipe_id = ANY(%s)"); cparams.append(scope)
-            cumul: dict = {}
-            with conn.cursor() as cur:
-                cur.execute(f"""
-                    SELECT dg.joueur_id, SUM(dg.distance_totale_m)
-                    FROM donnee_gps dg JOIN seance s ON s.id = dg.seance_id
-                    WHERE {' AND '.join(cwhere)}
-                    GROUP BY dg.joueur_id
-                """, cparams)
-                for jid, tot in cur.fetchall():
-                    cumul[str(jid)] = float(tot or 0.0)
+        def _drift(recent, ref):
+            """(direction, pct) si dérive au-delà du seuil, sinon None. ref insuffisant → None."""
+            if recent is None or ref is None or ref <= 0:
+                return None
+            pct = round((recent - ref) / ref * 100, 1)
+            if pct >= SEUIL:  return ("hausse", pct)
+            if pct <= -SEUIL: return ("baisse", pct)
+            return ("stable", pct)
 
-            joueurs = []
-            somme_ideal = 0.0
-            nb_ideal = 0
-            for (jid, nom, prenom, poste) in _joueurs_resume(conn, scope):
-                jid = str(jid)
-                cible = _charge_cible(jid, cfg, conn)
-                cible_ideal_m = None
-                if cible.get("disponible") and cible.get("unite") == "km" and cible.get("cible_ideal") is not None:
-                    cible_ideal_m = round(cible["cible_ideal"] * 1000)
-                    somme_ideal += cible_ideal_m
-                    nb_ideal += 1
-                cum = round(cumul.get(jid, 0.0))
-                obj = objectif_m if objectif_m is not None else cible_ideal_m
-                atteint = (cum >= obj) if obj else None
-                reste   = max(0, obj - cum) if obj else None
-                joueurs.append({
-                    "joueur_id":     jid,
-                    "nom":           nom,
-                    "prenom":        prenom,
-                    "poste":         poste or "",
-                    "cumul_m":       cum,
-                    "cible_ideal_m": cible_ideal_m,
-                    "cible_min_m":   round(cible["cible_min"]   * 1000) if cible_ideal_m is not None and cible.get("cible_min")   is not None else None,
-                    "cible_haute_m": round(cible["cible_haute"] * 1000) if cible_ideal_m is not None and cible.get("cible_haute") is not None else None,
-                    "plafond_m":     round(cible["plafond"]     * 1000) if cible_ideal_m is not None and cible.get("plafond")     is not None else None,
-                    "objectif_m":    obj,
-                    "source":        "MANUEL" if objectif_m is not None else ("INTELLIGENT" if cible_ideal_m is not None else None),
-                    "atteint":       atteint,
-                    "reste_m":       reste,
-                })
-
-            concernes    = [j for j in joueurs if j["atteint"] is not None]
-            nb_concernes = len(concernes)
-            nb_atteint   = sum(1 for j in concernes if j["atteint"])
-            meilleur = None
-            avec_obj = [j for j in joueurs if j["objectif_m"]]
-            if avec_obj:
-                m = max(avec_obj, key=lambda j: j["cumul_m"])
-                meilleur = {"joueur_id": m["joueur_id"], "nom": m["nom"],
-                            "prenom": m["prenom"], "cumul_m": m["cumul_m"]}
-
+        def _axe(code, libelle, sens_hausse, valeur):
+            hausse, baisse = [], []
+            for jid in ids:
+                d = _drift(*valeur(jid))
+                if d is None or d[0] == "stable":
+                    continue
+                ligne = {"joueur_id": jid, "nom": noms.get(jid, "joueur"), "drift_pct": d[1]}
+                (hausse if d[0] == "hausse" else baisse).append(ligne)
+            hausse.sort(key=lambda x: x["drift_pct"], reverse=True)
+            baisse.sort(key=lambda x: x["drift_pct"])
             return {
-                "objectif_distance_m":  objectif_m,
-                "suggestion_moyenne_m": round(somme_ideal / nb_ideal) if nb_ideal else None,
-                "multi_equipes":        bool(scope) and len(scope) > 1,
-                "nb_atteint":           nb_atteint,
-                "nb_concernes":         nb_concernes,
-                "meilleur":             meilleur,
-                "joueurs":              joueurs,
+                "code": code, "libelle": libelle, "sens_hausse": sens_hausse,
+                "nb_hausse": len(hausse), "nb_baisse": len(baisse),
+                "hausse": hausse[:5], "baisse": baisse[:5],
             }
+
+        axes = [
+            _axe("volume", "Volume (distance totale)", "charge en hausse",
+                 lambda jid: (gps.get(jid, (0, 0, 0, 0))[0], gps.get(jid, (0, 0, 0, 0))[1])),
+            _axe("intensite", "Haute intensité (≥ 19 km/h)", "sollicitation intense en hausse",
+                 lambda jid: (gps.get(jid, (0, 0, 0, 0))[2], gps.get(jid, (0, 0, 0, 0))[3])),
+            _axe("wellness", "Ressenti (fatigue subjective)", "fatigue en hausse",
+                 lambda jid: well.get(jid, (None, None))),
+        ]
+        return {
+            "fenetre_jours": 28,
+            "seuil_pct": SEUIL,
+            "effectif": {"nb_joueurs": len(ids)},
+            "axes": axes,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
