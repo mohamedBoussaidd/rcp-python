@@ -39,6 +39,16 @@ class ChargeCible(BaseModel):
     phrase: str
 
 
+class SimulationSeanceRequete(BaseModel):
+    """
+    Corps de la simulation « et si… » : une séance HYPOTHÉTIQUE à venir. `type_seance_id` sert à
+    choisir la baseline de chaque joueur (m/min sur ce type de séance) ; `duree_minutes` la projette
+    en distance attendue. Aucune séance n'est créée : c'est une projection, rien n'est écrit.
+    """
+    type_seance_id: Optional[UUID] = None   # None = baseline « toutes séances confondues »
+    duree_minutes: int
+
+
 class NiveauFatigue(BaseModel):
     joueur_id: UUID
     nom: str
