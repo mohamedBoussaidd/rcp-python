@@ -291,7 +291,11 @@ def _charge_gps(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> tuple | None
     """
     Charge externe (GPS) « découplée » — fenêtres NON chevauchantes :
       - aiguë           = SUM distances 7 derniers jours (mètres)
-      - chronique hebdo = SUM distances jours 8-35 / 4 semaines (mètres)
+      - chronique hebdo = SUM distances jours 8-35 ÷ semaines RÉELLEMENT présentes (plafonné à
+        `acwr_semaines_chronique`) — diviseur ADAPTATIF. Sans lui, un club à historique court
+        (< 4 sem.) voit sa chronique divisée par 4 alors qu'il n'a qu'~1 semaine de données →
+        ACWR faussement gonflé (~4) → risque sur-alarmé. Au régime établi (≥ cap sem.) le
+        diviseur vaut cap : comportement identique à avant.
     `date_ref` permet de calculer à une date passée (tendance). Défaut = aujourd'hui.
     Renvoie (aigue_m, chronique_hebdo_m) ou None si pas de base chronique.
     """
@@ -306,13 +310,16 @@ def _charge_gps(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> tuple | None
                              THEN dg.distance_totale_m ELSE 0 END) AS charge_aigue,
                     SUM(CASE WHEN s.date >= %s::date - INTERVAL '{jours_chronique} days'
                              AND s.date  < %s::date - INTERVAL '7 days'
-                             THEN dg.distance_totale_m ELSE 0 END) / %s AS charge_chronique_hebdo
+                             THEN dg.distance_totale_m ELSE 0 END) AS chronique_somme,
+                    COUNT(DISTINCT date_trunc('week', s.date))
+                        FILTER (WHERE s.date >= %s::date - INTERVAL '{jours_chronique} days'
+                                  AND s.date  < %s::date - INTERVAL '7 days') AS chronique_semaines
                 FROM donnee_gps dg
                 JOIN seance s ON dg.seance_id = s.id
                 WHERE dg.joueur_id = %s
                   AND s.date >= %s::date - INTERVAL '{jours_chronique} days'
                   AND s.date <= %s::date
-            """, (ref, ref, ref, float(sem_chronique), str(joueur_id), ref, ref))
+            """, (ref, ref, ref, ref, ref, str(joueur_id), ref, ref))
             row = cur.fetchone()
     except Exception:
         try:
@@ -321,20 +328,23 @@ def _charge_gps(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> tuple | None
             pass
         return None
 
-    if not row or row[1] is None or float(row[1]) == 0:
+    if not row or row[1] is None or float(row[1]) == 0 or not row[2]:
         return None
-    return (float(row[0] or 0), float(row[1]))
+    diviseur = min(sem_chronique, max(1, int(row[2])))
+    return (float(row[0] or 0), float(row[1]) / diviseur)
 
 
 def _charge_rpe(joueur_id: UUID, conn, date_ref=None) -> tuple | None:
     """
     Charge interne (sRPE = RPE × durée, saisie joueur) « découplée » :
       - aiguë           = SUM charges 7 derniers jours
-      - chronique hebdo = SUM charges jours 8-28 / 3 semaines
+      - chronique hebdo = SUM charges jours 8-28 ÷ semaines RÉELLEMENT présentes (plafonné à 3)
+        — diviseur ADAPTATIF, même raison que `_charge_gps` (pas de sous-estimation < 3 sem.).
     Sert de source de repli quand le GPS manque (séances techniques, sans gilets).
     Renvoie (aigue, chronique_hebdo) ou None si pas de base chronique / table absente.
     """
     ref = date_ref or _date.today()
+    sem_chronique = 3
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -343,13 +353,16 @@ def _charge_rpe(joueur_id: UUID, conn, date_ref=None) -> tuple | None:
                              THEN charge ELSE 0 END) AS aigue,
                     SUM(CASE WHEN date >= %s::date - INTERVAL '28 days'
                              AND date  < %s::date - INTERVAL '7 days'
-                             THEN charge ELSE 0 END) / 3.0 AS chronique_hebdo
+                             THEN charge ELSE 0 END) AS chronique_somme,
+                    COUNT(DISTINCT date_trunc('week', date))
+                        FILTER (WHERE date >= %s::date - INTERVAL '28 days'
+                                  AND date  < %s::date - INTERVAL '7 days') AS chronique_semaines
                 FROM rpe_seance
                 WHERE joueur_id = %s
                   AND date >= %s::date - INTERVAL '28 days'
                   AND date <= %s::date
                   AND charge IS NOT NULL
-            """, (ref, ref, ref, str(joueur_id), ref, ref))
+            """, (ref, ref, ref, ref, ref, str(joueur_id), ref, ref))
             row = cur.fetchone()
     except Exception:
         try:
@@ -358,9 +371,10 @@ def _charge_rpe(joueur_id: UUID, conn, date_ref=None) -> tuple | None:
             pass
         return None
 
-    if not row or row[1] is None or float(row[1]) == 0:
+    if not row or row[1] is None or float(row[1]) == 0 or not row[2]:
         return None
-    return (float(row[0] or 0), float(row[1]))
+    diviseur = min(sem_chronique, max(1, int(row[2])))
+    return (float(row[0] or 0), float(row[1]) / diviseur)
 
 
 def _charge_acwr_unifiee(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> dict:
