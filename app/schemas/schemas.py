@@ -3,6 +3,38 @@ from uuid import UUID
 from typing import Optional
 
 
+class Contribution(BaseModel):
+    """
+    Un facteur du score de risque, avec son poids. Permet au front d'afficher les 2 causes
+    principales puis de replier le reste — sans avoir à parser la phrase explicative.
+    """
+    facteur: str            # charge | blessure | poids
+    points: float           # points apportés au score (0-100)
+    libelle: str            # fait mesuré, prêt à afficher
+
+
+class SignalFatigue(BaseModel):
+    """
+    Un signal du score de fatigue. `fait` est la mesure (« vitesse max −12 % … »), `type_suggere`
+    l'étiquette physiologique correspondante (« fatigue neuromusculaire explosive probable »),
+    volontairement séparée pour que l'interface montre la mesure et relègue l'étiquette au détail.
+    """
+    facteur: str                            # charge_hebdo | performance_gps | monotonie | …
+    points: float
+    fait: str
+    type_suggere: Optional[str] = None
+
+
+class EcartSources(BaseModel):
+    """
+    Divergence entre charge mesurée (GPS) et charge ressentie (sRPE). L'ACWR mixte étant une
+    moyenne pondérée, il annule cet écart — qui est pourtant l'information la plus utile.
+    """
+    ecart: float           # acwr_rpe − acwr_gps (signé)
+    sens: str              # COHERENT | RESSENTI_SUP | MESURE_SUP
+    libelle: str
+
+
 class RisqueBlessure(BaseModel):
     joueur_id: UUID
     nom: str
@@ -20,6 +52,15 @@ class RisqueBlessure(BaseModel):
     periode_type: Optional[str] = None      # PREPARATION|COMPETITION|TREVE|REPRISE|INTERSAISON
     periode_libelle: Optional[str] = None
     jours_inactif: Optional[int] = None     # jours depuis la dernière donnée (None = jamais)
+    # Explicabilité : composition du score + décomposition de la charge (3 lectures de l'ACWR)
+    contributions: list[Contribution] = []
+    acwr: Optional[float] = None            # ratio retenu (selon `source`)
+    acwr_gps: Optional[float] = None        # ratio sur la charge mesurée seule
+    acwr_rpe: Optional[float] = None        # ratio sur la charge ressentie seule
+    semaines_gps: Optional[int] = None      # longueur de référence réellement utilisée (GPS)
+    semaines_rpe: Optional[int] = None      # idem pour le ressenti (fenêtres alignées)
+    ecart_sources: Optional[EcartSources] = None
+    provisoire: Optional[bool] = None       # baseline plus courte que la fenêtre cible
 
 
 class ChargeCible(BaseModel):
@@ -54,8 +95,12 @@ class NiveauFatigue(BaseModel):
     nom: str
     prenom: str
     score_fatigue: float  # 0-100
-    niveau: str           # FRAIS, FATIGUE, EPUISE
-    raison: str           # Explication lisible du niveau de fatigue
+    niveau: str           # NOMINAL, VIGILANCE, ALERTE
+    raison: str           # Explication lisible (conservée : phrase de repli)
+    # Explicabilité : signaux triés par poids décroissant + sous-signaux GPS informatifs
+    signaux: list[SignalFatigue] = []
+    indicatifs: list[str] = []
+    donnees: Optional[bool] = None  # False = aucune donnée de charge sur 28 j
 
 
 class ResumeJoueur(BaseModel):
@@ -82,3 +127,13 @@ class ResumeJoueur(BaseModel):
     periode_libelle: Optional[str] = None        # libellé lisible de la période courante
     jours_inactif: Optional[int] = None          # jours depuis la dernière donnée (None = jamais)
     blessure_jours_restants: Optional[int] = None  # jours avant retour prévu (négatif = dépassé)
+    # Explicabilité : /etat-effectif et les dashboards n'avaient QUE le score et le niveau, donc
+    # aucun moyen d'expliquer un chiffre. Les compositions arrivent maintenant avec la liste.
+    contributions: list[Contribution] = []       # composition du score de risque
+    signaux: list[SignalFatigue] = []            # composition du score de fatigue
+    acwr_gps: Optional[float] = None
+    acwr_rpe: Optional[float] = None
+    semaines_gps: Optional[int] = None
+    semaines_rpe: Optional[int] = None
+    ecart_sources: Optional[EcartSources] = None
+    provisoire: Optional[bool] = None

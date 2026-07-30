@@ -54,6 +54,14 @@ OBJECTIF_POSTE_KEY: dict[str, str] = {
 TYPES_MATCH    = ("MATCH", "MATCH_AMICAL")
 TYPES_INTENSIF = ("INTENSIF",)
 
+# Séparateur entre le FAIT MESURÉ et l'ÉTIQUETTE physiologique dans les raisons de fatigue.
+# `_calcul_fatigue` s'en sert pour découper chaque signal en deux champs exploitables par le
+# front. ⚠ Les producteurs de raisons (`_signal2_detail`, `_calcul_signal3/4`, `_signal_wellness`,
+# `_signal_srpe`, `_bonus_blessure`, `_bonus_congestion` et le signal 1) écrivent ce même littéral
+# dans leurs f-strings : le modifier ici sans le modifier là-bas ne casse rien mais l'étiquette
+# resterait collée au fait au lieu d'être isolée.
+MARQUEUR_TYPE = " · type suggéré : "
+
 
 def _normaliser_poste(poste: str) -> str:
     if not poste:
@@ -298,7 +306,9 @@ def _charge_gps(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> tuple | None
         ACWR faussement gonflé (~4) → risque sur-alarmé. Au régime établi (≥ cap sem.) le
         diviseur vaut cap : comportement identique à avant.
     `date_ref` permet de calculer à une date passée (tendance). Défaut = aujourd'hui.
-    Renvoie (aigue_m, chronique_hebdo_m) ou None si pas de base chronique.
+    Renvoie (aigue_m, chronique_hebdo_m, semaines_reelles) ou None si pas de base chronique.
+    Le 3e élément sert à signaler une baseline courte au front (« estimation provisoire ») ;
+    les appelants qui n'en ont pas besoin indexent simplement [0] et [1].
     """
     ref = date_ref or _date.today()
     sem_chronique = int(cfg.get("acwr_semaines_chronique", 4))
@@ -332,35 +342,43 @@ def _charge_gps(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> tuple | None
     if not row or row[1] is None or float(row[1]) == 0 or not row[2]:
         return None
     diviseur = min(sem_chronique, max(1, int(row[2])))
-    return (float(row[0] or 0), float(row[1]) / diviseur)
+    return (float(row[0] or 0), float(row[1]) / diviseur, diviseur)
 
 
-def _charge_rpe(joueur_id: UUID, conn, date_ref=None) -> tuple | None:
+def _charge_rpe(joueur_id: UUID, conn, date_ref=None, cfg: dict | None = None) -> tuple | None:
     """
     Charge interne (sRPE = RPE × durée, saisie joueur) « découplée » :
       - aiguë           = SUM charges 7 derniers jours
-      - chronique hebdo = SUM charges jours 8-28 ÷ semaines RÉELLEMENT présentes (plafonné à 3)
-        — diviseur ADAPTATIF, même raison que `_charge_gps` (pas de sous-estimation < 3 sem.).
+      - chronique hebdo = SUM charges de la fenêtre chronique ÷ semaines RÉELLEMENT présentes
+        — diviseur ADAPTATIF, même raison que `_charge_gps` (pas de sous-estimation).
     Sert de source de repli quand le GPS manque (séances techniques, sans gilets).
-    Renvoie (aigue, chronique_hebdo) ou None si pas de base chronique / table absente.
+
+    La fenêtre est ALIGNÉE sur celle du GPS (`acwr_semaines_chronique`, défaut 4) : elle était
+    figée à 3 semaines, si bien qu'`acwr_gps` et `acwr_rpe` ne reposaient pas sur la même
+    longueur de référence — une partie de leur écart n'était qu'un artefact de fenêtre, ce qui
+    rendait leur comparaison côte à côte trompeuse.
+
+    Renvoie (aigue, chronique_hebdo, semaines_reelles) ou None si pas de base chronique /
+    table absente.
     """
     ref = date_ref or _date.today()
-    sem_chronique = 3
+    sem_chronique = int((cfg or {}).get("acwr_semaines_chronique", 4))
+    jours_chronique = 7 + sem_chronique * 7
     try:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT
                     SUM(CASE WHEN date >= %s::date - INTERVAL '7 days'
                              THEN charge ELSE 0 END) AS aigue,
-                    SUM(CASE WHEN date >= %s::date - INTERVAL '28 days'
+                    SUM(CASE WHEN date >= %s::date - INTERVAL '{jours_chronique} days'
                              AND date  < %s::date - INTERVAL '7 days'
                              THEN charge ELSE 0 END) AS chronique_somme,
                     COUNT(DISTINCT date_trunc('week', date))
-                        FILTER (WHERE date >= %s::date - INTERVAL '28 days'
+                        FILTER (WHERE date >= %s::date - INTERVAL '{jours_chronique} days'
                                   AND date  < %s::date - INTERVAL '7 days') AS chronique_semaines
                 FROM rpe_seance
                 WHERE joueur_id = %s
-                  AND date >= %s::date - INTERVAL '28 days'
+                  AND date >= %s::date - INTERVAL '{jours_chronique} days'
                   AND date <= %s::date
                   AND charge IS NOT NULL
             """, (ref, ref, ref, ref, ref, str(joueur_id), ref, ref))
@@ -375,7 +393,7 @@ def _charge_rpe(joueur_id: UUID, conn, date_ref=None) -> tuple | None:
     if not row or row[1] is None or float(row[1]) == 0 or not row[2]:
         return None
     diviseur = min(sem_chronique, max(1, int(row[2])))
-    return (float(row[0] or 0), float(row[1]) / diviseur)
+    return (float(row[0] or 0), float(row[1]) / diviseur, diviseur)
 
 
 def _charge_acwr_unifiee(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> dict:
@@ -391,16 +409,23 @@ def _charge_acwr_unifiee(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> dic
     / `poids_charge_rpe`). Les charges aiguë/chronique renvoyées sont en km si le
     GPS est disponible (source GPS ou MIXTE), sinon en unités sRPE.
 
-    Renvoie : {source, acwr, aigue, chronique, unite, acwr_gps, acwr_rpe}.
+    Renvoie : {source, acwr, aigue, chronique, unite, acwr_gps, acwr_rpe,
+    semaines_gps, semaines_rpe} — les deux ratios isolés et le nombre de semaines de
+    référence réellement utilisées de chaque côté sont RAPPORTÉS (et non plus jetés) :
+    c'est l'écart entre GPS et ressenti qui informe, pas la seule moyenne pondérée qui
+    l'annule. Cf. `_ecart_sources()`.
     """
     gps = _charge_gps(joueur_id, cfg, conn, date_ref)
-    rpe = _charge_rpe(joueur_id, conn, date_ref)
+    rpe = _charge_rpe(joueur_id, conn, date_ref, cfg)
 
     acwr_gps = (gps[0] / gps[1]) if gps and gps[1] > 0 else None
     acwr_rpe = (rpe[0] / rpe[1]) if rpe and rpe[1] > 0 else None
+    sem_gps  = gps[2] if gps and len(gps) > 2 else None
+    sem_rpe  = rpe[2] if rpe and len(rpe) > 2 else None
 
     vide = {"source": None, "acwr": None, "aigue": None, "chronique": None,
-            "unite": None, "acwr_gps": None, "acwr_rpe": None}
+            "unite": None, "acwr_gps": None, "acwr_rpe": None,
+            "semaines_gps": None, "semaines_rpe": None}
 
     if acwr_gps is not None and acwr_rpe is not None:
         w_g = float(cfg.get("poids_charge_gps", 0.6))
@@ -408,16 +433,46 @@ def _charge_acwr_unifiee(joueur_id: UUID, cfg: dict, conn, date_ref=None) -> dic
         acwr = (w_g * acwr_gps + w_r * acwr_rpe) / (w_g + w_r)
         return {"source": "MIXTE", "acwr": round(acwr, 2),
                 "aigue": round(gps[0] / 1000, 1), "chronique": round(gps[1] / 1000, 1),
-                "unite": "km", "acwr_gps": round(acwr_gps, 2), "acwr_rpe": round(acwr_rpe, 2)}
+                "unite": "km", "acwr_gps": round(acwr_gps, 2), "acwr_rpe": round(acwr_rpe, 2),
+                "semaines_gps": sem_gps, "semaines_rpe": sem_rpe}
     if acwr_gps is not None:
         return {"source": "GPS", "acwr": round(acwr_gps, 2),
                 "aigue": round(gps[0] / 1000, 1), "chronique": round(gps[1] / 1000, 1),
-                "unite": "km", "acwr_gps": round(acwr_gps, 2), "acwr_rpe": None}
+                "unite": "km", "acwr_gps": round(acwr_gps, 2), "acwr_rpe": None,
+                "semaines_gps": sem_gps, "semaines_rpe": None}
     if acwr_rpe is not None:
         return {"source": "RPE", "acwr": round(acwr_rpe, 2),
                 "aigue": round(rpe[0], 0), "chronique": round(rpe[1], 0),
-                "unite": "sRPE", "acwr_gps": None, "acwr_rpe": round(acwr_rpe, 2)}
+                "unite": "sRPE", "acwr_gps": None, "acwr_rpe": round(acwr_rpe, 2),
+                "semaines_gps": None, "semaines_rpe": sem_rpe}
     return vide
+
+
+def _ecart_sources(charge: dict, cfg: dict) -> dict | None:
+    """
+    Divergence entre charge EXTERNE (GPS) et charge RESSENTIE (sRPE), quand les deux
+    existent. L'ACWR mixte est une moyenne pondérée : elle ANNULE justement le cas le plus
+    utile (« il en fait autant mais le vit mal »). On rapporte donc l'écart signé et une
+    lecture prête à afficher. Seuil configurable `seuil_ecart_sources` (défaut 0.30).
+
+    Renvoie None si une seule source, sinon {ecart, sens, libelle}.
+    """
+    a_gps, a_rpe = charge.get("acwr_gps"), charge.get("acwr_rpe")
+    if a_gps is None or a_rpe is None:
+        return None
+
+    seuil = float(cfg.get("seuil_ecart_sources", 0.30))
+    ecart = round(a_rpe - a_gps, 2)
+    if abs(ecart) < seuil:
+        return {"ecart": ecart, "sens": "COHERENT",
+                "libelle": "charge mesurée et ressenti concordants"}
+    if ecart > 0:
+        return {"ecart": ecart, "sens": "RESSENTI_SUP",
+                "libelle": "charge mesurée stable mais ressenti en hausse — "
+                           "fatigue extra-sportive possible (sommeil, maladie, vie perso)"}
+    return {"ecart": ecart, "sens": "MESURE_SUP",
+            "libelle": "charge mesurée en hausse mais peu ressentie — "
+                       "bonne tolérance, ou sous-déclaration du RPE"}
 
 
 def _count_blessures_risque(joueur_id: UUID, conn, date_ref=None) -> int:
@@ -510,6 +565,9 @@ def _calcul_score_risque(joueur_id: UUID, cfg: dict, conn, date_ref=None,
             contributions.append({"facteur": "poids", "points": round(pts, 1),
                                   "libelle": f"surpoids +{round(ecart_kg, 1)} kg vs poids de forme"})
 
+    sem_gps = charge.get("semaines_gps")
+    cap_gps = int(cfg.get("acwr_semaines_chronique", 4))
+
     return {
         "score":               min(round(score, 1), 100.0),
         "acwr":                acwr,
@@ -518,6 +576,15 @@ def _calcul_score_risque(joueur_id: UUID, cfg: dict, conn, date_ref=None,
         "source":              charge["source"],
         "unite":               charge["unite"],
         "contributions":       contributions,
+        # Décomposition de la charge : les deux ratios isolés + leur fenêtre de référence,
+        # pour que le front affiche les 3 lectures (mixte, GPS, ressenti) au lieu d'une seule.
+        "acwr_gps":            charge.get("acwr_gps"),
+        "acwr_rpe":            charge.get("acwr_rpe"),
+        "semaines_gps":        sem_gps,
+        "semaines_rpe":        charge.get("semaines_rpe"),
+        "ecart_sources":       _ecart_sources(charge, cfg),
+        # Baseline plus courte que le cap → le ratio est mathématiquement plus instable.
+        "provisoire":          bool(sem_gps is not None and sem_gps < cap_gps),
     }
 
 
@@ -689,7 +756,7 @@ def _simuler_acwr(joueur_id: UUID, cfg: dict, conn, delta_m: float = 0.0) -> dic
     Renvoie {source, acwr_avant, acwr_apres, aigue_avant_km, aigue_apres_km, chronique_km}.
     """
     gps = _charge_gps(joueur_id, cfg, conn)
-    rpe = _charge_rpe(joueur_id, conn)
+    rpe = _charge_rpe(joueur_id, conn, None, cfg)
     w_g = float(cfg.get("poids_charge_gps", 0.6))
     w_r = float(cfg.get("poids_charge_rpe", 0.4))
 
@@ -1281,6 +1348,35 @@ def _calcul_fatigue(joueur_id: UUID, cfg: dict, conn) -> dict:
 
     score = min(s1_score + s2_score + s3_score + s4_score + w_score + sr_score + b_score + c_score, 100.0)
 
+    # ── Signaux structurés ──
+    # Chaque signal expose son POIDS et deux textes séparés : le FAIT MESURÉ (« vitesse max −12 %
+    # (28,4 km/h, réf. 32,3) ») et l'ÉTIQUETTE physiologique suggérée (« fatigue neuromusculaire
+    # explosive probable »). Le front met le fait en avant et relègue l'étiquette au détail, avec
+    # lien vers la méthodologie : le vocabulaire scientifique reste juste sans parler en premier.
+    # Auparavant tout était concaténé dans `raison`, ce qui obligeait à parser une phrase française.
+    brut = [
+        ("charge_hebdo",     s1_score, s1_raison),
+        ("performance_gps",  s2_score, s2_raison),
+        ("monotonie",        s3_score, s3_raison),
+        ("recuperation",     s4_score, s4_raison),
+        ("ressenti",         w_score,  w_raison),
+        ("charge_ressentie", sr_score, sr_raison),
+        ("blessure",         b_score,  b_raison),
+        ("congestion",       c_score,  c_raison),
+    ]
+    signaux = []
+    for facteur, pts, texte in brut:
+        if not texte:
+            continue
+        fait, _, type_suggere = texte.partition(MARQUEUR_TYPE)
+        signaux.append({
+            "facteur":      facteur,
+            "points":       float(pts),
+            "fait":         fait.strip(" ·"),
+            "type_suggere": type_suggere.strip() or None,
+        })
+    signaux.sort(key=lambda s: s["points"], reverse=True)
+
     # ── Message ──
     parties = [r for r in [s1_raison, s2_raison, s3_raison, s4_raison, w_raison, sr_raison, b_raison, c_raison] if r]
     indicatifs = [s["msg"] for s in s2_details if s.get("msg")]
@@ -1296,7 +1392,14 @@ def _calcul_fatigue(joueur_id: UUID, cfg: dict, conn) -> dict:
         if indicatifs:
             raison += " Indicateurs — " + " · ".join(indicatifs) + "."
 
-    return {"score": round(score, 1), "niveau": _niveau_fatigue(score), "raison": raison}
+    return {
+        "score":      round(score, 1),
+        "niveau":     _niveau_fatigue(score),
+        "raison":     raison,
+        "signaux":    signaux,
+        "indicatifs": indicatifs,
+        "donnees":    bool(rows_charge),
+    }
 
 
 def _readiness_joueur(joueur_id: UUID, conn) -> tuple:
@@ -1537,7 +1640,10 @@ def _risque_probabiliste(joueur_id: UUID, cfg: dict, conn, ctx=None, date_ref=No
             "BLESSE":      "Joueur en cours de blessure — suivi médical, charge non évaluée.",
         }.get(ctx["etat"], "Risque non évalué.")
         return {**base, "score": 0.0, "probabilite": None, "niveau": "FAIBLE",
-                "phrase": phrase, "facteur_dominant": None, "tendance": "STABLE", "source": None}
+                "phrase": phrase, "facteur_dominant": None, "tendance": "STABLE", "source": None,
+                "contributions": [], "acwr": None, "acwr_gps": None, "acwr_rpe": None,
+                "semaines_gps": None, "semaines_rpe": None, "ecart_sources": None,
+                "provisoire": False}
 
     risque = _calcul_score_risque(joueur_id, cfg, conn, date_ref=date_ref,
                                   neutraliser_acwr=ctx["neutraliser_acwr"])
@@ -1564,8 +1670,12 @@ def _risque_probabiliste(joueur_id: UUID, cfg: dict, conn, ctx=None, date_ref=No
     except Exception:
         tendance, fleche = "STABLE", "→ stable"
 
+    # Sans base de charge, le score retombe sur un plancher conventionnel (20) : afficher une
+    # probabilité dérivée de ce plancher ferait passer un joueur SANS DONNÉES pour un joueur
+    # sain. On coupe donc la probabilité — le score reste, mais il n'est plus habillé en %.
     if risque["acwr"] is None:
         phrase = "Données de charge insuffisantes pour estimer le risque."
+        proba  = None
     else:
         phrase = f"Risque ~{proba} % à 7 jours"
         if facteur_dominant:
@@ -1581,6 +1691,16 @@ def _risque_probabiliste(joueur_id: UUID, cfg: dict, conn, ctx=None, date_ref=No
         "facteur_dominant": facteur_dominant,
         "tendance":         tendance,
         "source":           risque.get("source"),
+        # Explicabilité : la liste complète des facteurs (triée par poids décroissant) permet au
+        # front d'afficher les 2 causes principales puis de replier le reste, sans parser la phrase.
+        "contributions":    sorted(contributions, key=lambda c: c["points"], reverse=True),
+        "acwr":             risque.get("acwr"),
+        "acwr_gps":         risque.get("acwr_gps"),
+        "acwr_rpe":         risque.get("acwr_rpe"),
+        "semaines_gps":     risque.get("semaines_gps"),
+        "semaines_rpe":     risque.get("semaines_rpe"),
+        "ecart_sources":    risque.get("ecart_sources"),
+        "provisoire":       risque.get("provisoire", False),
     }
 
 
@@ -1617,6 +1737,14 @@ def get_risque_blessure(joueur_id: UUID, x_date_simulee: str | None = Header(def
             periode_type=r.get("periode_type"),
             periode_libelle=r.get("periode_libelle"),
             jours_inactif=r.get("jours_inactif"),
+            contributions=r.get("contributions") or [],
+            acwr=r.get("acwr"),
+            acwr_gps=r.get("acwr_gps"),
+            acwr_rpe=r.get("acwr_rpe"),
+            semaines_gps=r.get("semaines_gps"),
+            semaines_rpe=r.get("semaines_rpe"),
+            ecart_sources=r.get("ecart_sources"),
+            provisoire=r.get("provisoire"),
         )
     except HTTPException:
         raise
@@ -1669,7 +1797,8 @@ def get_fatigue(joueur_id: UUID, x_date_simulee: str | None = Header(default=Non
                     "INACTIF":     f"Aucune donnée récente{depuis} — fatigue non évaluée.",
                     "BLESSE":      "Joueur en cours de blessure — fatigue d'entraînement non évaluée.",
                 }.get(ctx["etat"], "Fatigue non évaluée.")
-                fatigue = {"score": 0.0, "niveau": "NOMINAL", "raison": raison}
+                fatigue = {"score": 0.0, "niveau": "NOMINAL", "raison": raison,
+                           "signaux": [], "indicatifs": [], "donnees": False}
             else:
                 fatigue = _calcul_fatigue(joueur_id, cfg, conn)
 
@@ -1680,6 +1809,9 @@ def get_fatigue(joueur_id: UUID, x_date_simulee: str | None = Header(default=Non
             score_fatigue=fatigue["score"],
             niveau=fatigue["niveau"],
             raison=fatigue["raison"],
+            signaux=fatigue.get("signaux") or [],
+            indicatifs=fatigue.get("indicatifs") or [],
+            donnees=fatigue.get("donnees"),
         )
     except HTTPException:
         raise
@@ -2519,6 +2651,17 @@ def get_resume_equipe(x_date_simulee: str | None = Header(default=None),
                     monotonie=_monotonie_joueur(joueur_id, cfg, conn),
                     sprint_niveau=sprint["niveau"],
                     sprint_message=sprint["message"],
+                    # Composition des deux scores : sans ça, /etat-effectif et les dashboards
+                    # affichaient un chiffre sans pouvoir l'expliquer.
+                    contributions=sorted(risque.get("contributions") or [],
+                                         key=lambda c: c["points"], reverse=True),
+                    signaux=fatigue.get("signaux") or [],
+                    acwr_gps=risque.get("acwr_gps"),
+                    acwr_rpe=risque.get("acwr_rpe"),
+                    semaines_gps=risque.get("semaines_gps"),
+                    semaines_rpe=risque.get("semaines_rpe"),
+                    ecart_sources=risque.get("ecart_sources"),
+                    provisoire=risque.get("provisoire"),
                 ))
 
         return resultats
