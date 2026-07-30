@@ -263,6 +263,18 @@ def _poids_seance(type_code: str, cfg: dict) -> float:
     return cfg.get(key, 0.60) if key else 0.60
 
 
+def _lundi(d):
+    """
+    Lundi de la semaine ISO de `d` — équivalent Python de `date_trunc('week', …)` en SQL.
+    Sert à compter les semaines RÉELLEMENT présentes dans une fenêtre de référence côté Python,
+    quand la requête ramène déjà les lignes (inutile de refaire un COUNT en base).
+    Tolère un `datetime` comme une `date`.
+    """
+    if hasattr(d, "date"):
+        d = d.date()
+    return d - _timedelta(days=d.weekday())
+
+
 def _objectif_poste(poste: str, cfg: dict) -> float | None:
     key = OBJECTIF_POSTE_KEY.get(poste, "")
     return cfg.get(key) if key else None
@@ -882,12 +894,28 @@ def _simulation_seance_data(conn, cfg, scope, type_seance_id, duree_minutes: int
 def _signal2_detail(joueur_id: UUID, types: tuple, label_groupe: str,
                     cfg: dict, conn) -> tuple:
     """
-    Signal 2 enrichi — 3 sous-signaux sur les 10 dernières séances du groupe (≤ 60 jours) :
+    Signal 2 enrichi — 3 sous-signaux sur les dernières séances du groupe (≤ 60 jours) :
       A — m/min global          → fatigue générale
       B — vitesse max           → fatigue neuromusculaire explosive
       C — ratio dist >19 km/h   → fatigue neuromusculaire intensive
+
+    Chaque sous-signal compare la moyenne de ses N séances les plus RÉCENTES à celle des séances
+    plus anciennes du même groupe. N est réglable INDÉPENDAMMENT pour les trois
+    (`nb_seances_recentes_intensite` / `_vmax` / `_hi`, défaut 2) : une vitesse de pointe jugée
+    sur 2 séances est bien plus bruitée qu'une intensité moyenne, et le staff doit pouvoir
+    arbitrer réactivité contre stabilité indicateur par indicateur. `nb_seances_reference_min`
+    fixe le minimum de séances de comparaison exigé (défaut 2) — c'était un `len(rows) < 4` en
+    dur, garde-fou unique pour les trois sous-signaux.
     Seuils lus depuis la configuration.
     """
+    n_a     = max(1, int(cfg.get("nb_seances_recentes_intensite", 2)))
+    n_b     = max(1, int(cfg.get("nb_seances_recentes_vmax",      2)))
+    n_c     = max(1, int(cfg.get("nb_seances_recentes_hi",        2)))
+    ref_min = max(1, int(cfg.get("nb_seances_reference_min",      2)))
+    # Profondeur de référence conservée (8 séances au-delà des récentes = les 10 d'avant avec les
+    # valeurs par défaut) : augmenter N ne doit pas rogner la base de comparaison.
+    limite  = max(n_a, n_b, n_c) + 8
+
     with conn.cursor() as cur:
         cur.execute("""
             SELECT dg.distance_totale_m, dg.duree_minutes,
@@ -900,13 +928,25 @@ def _signal2_detail(joueur_id: UUID, types: tuple, label_groupe: str,
               AND dg.distance_totale_m > 0
               AND dg.duree_minutes > 0
               AND s.date >= CURRENT_DATE - INTERVAL '60 days'
-            ORDER BY s.date DESC
-            LIMIT 10
-        """, (str(joueur_id), list(types)))
+            ORDER BY s.date DESC, dg.id DESC
+            LIMIT %s
+        """, (str(joueur_id), list(types), limite))
         rows = cur.fetchall()
 
-    if len(rows) < 4:
+    if not rows:
         return 0, None, []
+
+    def _decoupe(valeurs: list, n: int) -> tuple | None:
+        """
+        Moyenne des `n` valeurs les plus récentes vs moyenne des plus anciennes.
+        None si la base de comparaison est trop courte (< `ref_min`) : le sous-signal est alors
+        simplement absent plutôt que calculé sur une référence d'une seule séance.
+        """
+        if len(valeurs) < n + ref_min:
+            return None
+        recent    = sum(valeurs[:n]) / n
+        reference = sum(valeurs[n:]) / len(valeurs[n:])
+        return (recent, reference) if reference > 0 else None
 
     sous_signaux = []
 
@@ -918,10 +958,9 @@ def _signal2_detail(joueur_id: UUID, types: tuple, label_groupe: str,
     s_hi_poss   = cfg.get("seuil_hi_possible",   0.85)
 
     # ── A : m/min global ──
-    ratios_a = [float(r[0]) / float(r[1]) for r in rows]
-    ra = sum(ratios_a[:2]) / 2
-    ha = sum(ratios_a[2:]) / len(ratios_a[2:])
-    if ha > 0:
+    decoupe_a = _decoupe([float(r[0]) / float(r[1]) for r in rows], n_a)
+    if decoupe_a:
+        ra, ha  = decoupe_a
         ratio_a = ra / ha
         pct_a   = round((1 - ratio_a) * 100)
         if ratio_a <= s_mmin_prob:
@@ -933,51 +972,47 @@ def _signal2_detail(joueur_id: UUID, types: tuple, label_groupe: str,
         sous_signaux.append({
             "score": sc_a, "type": type_a,
             "msg": f"intensité globale {'−'+str(pct_a)+'%' if pct_a > 0 else 'stable'} "
-                   f"({round(ra,1)} m/min, réf. {round(ha,1)})"
+                   f"({round(ra,1)} m/min sur {n_a} séance{'s' if n_a > 1 else ''}, réf. {round(ha,1)})"
         })
 
     # ── B : vitesse max ──
-    vmax_rows = [r for r in rows if r[2] is not None]
-    if len(vmax_rows) >= 4:
-        rb = sum(float(r[2]) for r in vmax_rows[:2]) / 2
-        hb = sum(float(r[2]) for r in vmax_rows[2:]) / len(vmax_rows[2:])
-        if hb > 0:
-            ratio_b = rb / hb
-            pct_b   = round((1 - ratio_b) * 100)
-            if ratio_b <= s_vmax_prob:
-                sc_b, type_b = 55, "fatigue neuromusculaire explosive probable"
-            elif ratio_b <= s_vmax_poss:
-                sc_b, type_b = 30, "fatigue neuromusculaire explosive possible"
-            else:
-                sc_b, type_b = 0, None
-            sous_signaux.append({
-                "score": sc_b, "type": type_b,
-                "msg": f"vitesse max {'−'+str(pct_b)+'%' if pct_b > 0 else 'stable'} "
-                       f"({round(rb,1)} km/h, réf. {round(hb,1)})"
-            })
+    decoupe_b = _decoupe([float(r[2]) for r in rows if r[2] is not None], n_b)
+    if decoupe_b:
+        rb, hb  = decoupe_b
+        ratio_b = rb / hb
+        pct_b   = round((1 - ratio_b) * 100)
+        if ratio_b <= s_vmax_prob:
+            sc_b, type_b = 55, "fatigue neuromusculaire explosive probable"
+        elif ratio_b <= s_vmax_poss:
+            sc_b, type_b = 30, "fatigue neuromusculaire explosive possible"
+        else:
+            sc_b, type_b = 0, None
+        sous_signaux.append({
+            "score": sc_b, "type": type_b,
+            "msg": f"vitesse max {'−'+str(pct_b)+'%' if pct_b > 0 else 'stable'} "
+                   f"({round(rb,1)} km/h sur {n_b} séance{'s' if n_b > 1 else ''}, réf. {round(hb,1)})"
+        })
 
     # ── C : ratio dist >19 km/h / distance totale ──
-    hi_rows = [r for r in rows if r[3] is not None and float(r[0]) > 0]
-    if len(hi_rows) >= 4:
-        ratios_c = [float(r[3]) / float(r[0]) for r in hi_rows]
-        rc = sum(ratios_c[:2]) / 2
-        hc = sum(ratios_c[2:]) / len(ratios_c[2:])
-        if hc > 0:
-            ratio_c = rc / hc
-            pct_c   = round((1 - ratio_c) * 100)
-            rc_pct  = round(rc * 100, 1)
-            hc_pct  = round(hc * 100, 1)
-            if ratio_c <= s_hi_prob:
-                sc_c, type_c = 55, "fatigue neuromusculaire intensive probable"
-            elif ratio_c <= s_hi_poss:
-                sc_c, type_c = 30, "fatigue neuromusculaire intensive possible"
-            else:
-                sc_c, type_c = 0, None
-            sous_signaux.append({
-                "score": sc_c, "type": type_c,
-                "msg": f"efforts >19 km/h {'−'+str(pct_c)+'%' if pct_c > 0 else 'stables'} "
-                       f"({rc_pct}% vs {hc_pct}% de la dist.)"
-            })
+    decoupe_c = _decoupe(
+        [float(r[3]) / float(r[0]) for r in rows if r[3] is not None and float(r[0]) > 0], n_c)
+    if decoupe_c:
+        rc, hc  = decoupe_c
+        ratio_c = rc / hc
+        pct_c   = round((1 - ratio_c) * 100)
+        rc_pct  = round(rc * 100, 1)
+        hc_pct  = round(hc * 100, 1)
+        if ratio_c <= s_hi_prob:
+            sc_c, type_c = 55, "fatigue neuromusculaire intensive probable"
+        elif ratio_c <= s_hi_poss:
+            sc_c, type_c = 30, "fatigue neuromusculaire intensive possible"
+        else:
+            sc_c, type_c = 0, None
+        sous_signaux.append({
+            "score": sc_c, "type": type_c,
+            "msg": f"efforts >19 km/h {'−'+str(pct_c)+'%' if pct_c > 0 else 'stables'} "
+                   f"({rc_pct}% sur {n_c} séance{'s' if n_c > 1 else ''} vs {hc_pct}% de la dist.)"
+        })
 
     if not sous_signaux:
         return 0, None, []
@@ -1171,50 +1206,34 @@ def _signal_wellness(joueur_id: UUID, cfg: dict, conn) -> tuple:
 def _signal_srpe(joueur_id: UUID, cfg: dict, conn) -> tuple:
     """
     Signal sRPE — charge subjective (RPE × durée) saisie par le joueur.
-    ACWR sur la charge ressentie : aiguë (7 j) vs chronique hebdo (jours 8-28 / 3).
+    ACWR sur la charge ressentie : aiguë (7 j) vs chronique hebdomadaire.
     Complète la charge GPS (utile notamment pour les séances sans GPS, ex. techniques).
+
+    Le calcul de charge est DÉLÉGUÉ à `_charge_rpe`, qui applique la fenêtre configurée
+    (`acwr_semaines_chronique`) et le diviseur ADAPTATIF. Ce signal refaisait auparavant sa
+    propre requête, avec une fenêtre figée à 28 jours et un diviseur figé à 3 : sur un
+    historique court il gonflait mécaniquement le ratio, et il pouvait contredire la carte
+    ACWR ressentie du même joueur. Une seule source de vérité désormais.
+
     Renvoie (0, None) si données insuffisantes ou table absente.
     """
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    SUM(CASE WHEN date >= CURRENT_DATE - INTERVAL '7 days'
-                             THEN charge ELSE 0 END) AS aigue,
-                    SUM(CASE WHEN date >= CURRENT_DATE - INTERVAL '28 days'
-                             AND date  < CURRENT_DATE - INTERVAL '7 days'
-                             THEN charge ELSE 0 END) / 3.0 AS chronique_hebdo
-                FROM rpe_seance
-                WHERE joueur_id = %s
-                  AND date >= CURRENT_DATE - INTERVAL '28 days'
-                  AND charge IS NOT NULL
-            """, (str(joueur_id),))
-            row = cur.fetchone()
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+    charge = _charge_rpe(joueur_id, conn, None, cfg)
+    if not charge or charge[1] <= 0 or charge[0] <= 0:
         return 0, None
 
-    if not row or row[1] is None or float(row[1]) == 0:
-        return 0, None
-
-    aigue     = float(row[0] or 0)
-    chronique = float(row[1])
-    if aigue <= 0:
-        return 0, None
-
+    aigue, chronique, semaines = charge[0], charge[1], charge[2]
     ratio = aigue / chronique
     pct   = round((ratio - 1) * 100)
     seuil_prob = cfg.get("seuil_srpe_probable", 1.50)
     seuil_poss = cfg.get("seuil_srpe_possible", 1.30)
+    cap     = int(cfg.get("acwr_semaines_chronique", 4))
+    ref_txt = f" (réf. {semaines} sem.)" if semaines < cap else ""
 
     if ratio >= seuil_prob:
-        return 25, (f"charge ressentie (sRPE) +{pct}% vs habituel"
+        return 25, (f"charge ressentie (sRPE) +{pct}% vs habituel{ref_txt}"
                     f" · type suggéré : surcharge subjective probable")
     elif ratio >= seuil_poss:
-        return 12, (f"charge ressentie (sRPE) élevée +{pct}%"
+        return 12, (f"charge ressentie (sRPE) élevée +{pct}%{ref_txt}"
                     f" · type suggéré : surcharge subjective possible")
     return 0, None
 
@@ -1279,22 +1298,41 @@ def _calcul_fatigue(joueur_id: UUID, cfg: dict, conn) -> dict:
     Tous les seuils sont lus depuis la configuration.
     """
     # ── Signal 1 ──
+    # Fenêtre de référence ALIGNÉE sur celle de l'ACWR (`acwr_semaines_chronique`) : elle était
+    # figée à 21 jours ici et vaut 4 semaines là-bas, si bien que la carte ACWR et ce signal
+    # parlaient de « la semaine normale » sur deux périodes différentes — et pouvaient donc se
+    # contredire à l'écran pour le même joueur.
+    sem_ref   = int(cfg.get("acwr_semaines_chronique", 4))
+    jours_ref = 7 + sem_ref * 7
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT ts.code, dg.distance_totale_m,
+        cur.execute(f"""
+            SELECT ts.code, dg.distance_totale_m, s.date,
                    s.date >= CURRENT_DATE - INTERVAL '7 days' AS est_recent
             FROM donnee_gps dg
             JOIN seance s ON dg.seance_id = s.id
             JOIN type_seance ts ON s.type_seance_id = ts.id
             WHERE dg.joueur_id = %s
-              AND s.date >= CURRENT_DATE - INTERVAL '28 days'
+              AND s.date >= CURRENT_DATE - INTERVAL '{jours_ref} days'
               AND dg.distance_totale_m > 0
         """, (str(joueur_id),))
         rows_charge = cur.fetchall()
 
-    charge_7j  = sum(float(r[1]) * _poids_seance(r[0], cfg) for r in rows_charge if r[2])
-    charge_21j = sum(float(r[1]) * _poids_seance(r[0], cfg) for r in rows_charge if not r[2])
-    charge_chrono_hebdo = charge_21j / 3 if charge_21j > 0 else None
+    lignes_ref = [r for r in rows_charge if not r[3]]
+    charge_7j  = sum(float(r[1]) * _poids_seance(r[0], cfg) for r in rows_charge if r[3])
+    charge_ref = sum(float(r[1]) * _poids_seance(r[0], cfg) for r in lignes_ref)
+
+    # Diviseur ADAPTATIF — semaines RÉELLEMENT présentes dans la fenêtre de référence, plafonnées
+    # au cap configuré. Il était figé à 3 : un historique court (reprise, club neuf, joueur qui
+    # vient d'arriver) voyait sa « semaine normale » divisée par 3 alors qu'il n'avait qu'une
+    # semaine de données, et la semaine en cours paraissait 3× plus chargée qu'elle ne l'était
+    # (+246 % affiché pour +15 % réels). Même règle que `_charge_gps` / `_charge_rpe` :
+    # ⚠ ces trois endroits calculent une charge hebdomadaire de référence et doivent être
+    # corrigés ENSEMBLE — la correction de `_charge_gps` avait justement oublié celui-ci.
+    # On ne fusionne pas pour autant avec `_charge_gps` : ici les distances sont PONDÉRÉES par
+    # type de séance (`_poids_seance`), ce que l'ACWR ne fait pas.
+    semaines_ref = len({_lundi(r[2]) for r in lignes_ref})
+    diviseur     = min(sem_ref, max(1, semaines_ref))
+    charge_chrono_hebdo = charge_ref / diviseur if charge_ref > 0 else None
 
     s1_score  = 0
     s1_raison = None
@@ -1306,16 +1344,19 @@ def _calcul_fatigue(joueur_id: UUID, cfg: dict, conn) -> dict:
         pct          = round((ratio_charge - 1) * 100)
         km_7j        = round(charge_7j / 1000, 1)
         km_normal    = round(charge_chrono_hebdo / 1000, 1)
+        # La profondeur réellement disponible est annoncée : une référence d'une seule semaine
+        # reste un repère fragile, autant que le staff le voie plutôt que de le deviner.
+        ref_txt = f", réf. {diviseur} sem." if diviseur < sem_ref else ""
         if ratio_charge >= seuil_prob:
             s1_score  = 45
             s1_raison = (
-                f"surcharge hebdomadaire +{pct}% ({km_7j} km pondérés vs {km_normal} km normal)"
+                f"surcharge hebdomadaire +{pct}% ({km_7j} km pondérés vs {km_normal} km normal{ref_txt})"
                 f" · type suggéré : surcharge métabolique probable"
             )
         elif ratio_charge >= seuil_poss:
             s1_score  = 25
             s1_raison = (
-                f"charge hebdomadaire élevée +{pct}% ({km_7j} km pondérés vs {km_normal} km normal)"
+                f"charge hebdomadaire élevée +{pct}% ({km_7j} km pondérés vs {km_normal} km normal{ref_txt})"
                 f" · type suggéré : surcharge métabolique possible"
             )
 
