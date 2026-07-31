@@ -818,11 +818,40 @@ def _simulation_seance_data(conn, cfg, scope, type_seance_id, duree_minutes: int
     duree = max(1, int(duree_minutes or 0))
 
     libelle_type = None
+    profil_type = "TERRAIN"
     if type_seance_id:
         with conn.cursor() as cur:
-            cur.execute("SELECT libelle FROM type_seance WHERE id = %s", (str(type_seance_id),))
+            cur.execute("SELECT libelle, profil FROM type_seance WHERE id = %s", (str(type_seance_id),))
             row = cur.fetchone()
-            libelle_type = row[0] if row else None
+            if row:
+                libelle_type = row[0]
+                profil_type = row[1] or "TERRAIN"
+
+    # Un type qui ne produit PAS de déplacement mesuré (musculation, piscine, vidéo) n'a pas de
+    # distance attendue — et surtout pas celle des séances de terrain. Sans cette garde, le repli
+    # « baseline globale » ci-dessous annonçait tranquillement « 6,2 km attendus » pour une séance
+    # de squats, puis recalculait un ACWR sur cette distance imaginaire.
+    if profil_type != "TERRAIN":
+        return {
+            "seance": {
+                "type_seance_id": str(type_seance_id) if type_seance_id else None,
+                "type_libelle":   libelle_type,
+                "profil":         profil_type,
+                "duree_minutes":  duree,
+            },
+            "synthese": {
+                "nb_evalues": 0, "nb_sans_baseline": 0,
+                "nb_surcharge_avant": 0, "nb_surcharge_apres": 0,
+                "nb_bascule": 0, "km_attendu_moyen": None,
+                "nb_peu_fiable": 0,
+            },
+            "joueurs": [],
+            "non_applicable": (
+                f"La simulation de distance ne s'applique pas à une séance « {libelle_type or profil_type} » : "
+                "ce type ne produit pas de déplacement mesuré au GPS. Sa charge est comptée via le sRPE "
+                "une fois la séance notée par les joueurs."
+            ),
+        }
 
     joueurs = []
     for (jid, nom, prenom, poste) in _joueurs_resume(conn, scope):
@@ -876,6 +905,7 @@ def _simulation_seance_data(conn, cfg, scope, type_seance_id, duree_minutes: int
         "seance": {
             "type_seance_id": str(type_seance_id) if type_seance_id else None,
             "type_libelle":   libelle_type,
+            "profil":         profil_type,
             "duree_minutes":  duree,
         },
         "synthese": {
