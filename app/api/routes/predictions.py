@@ -747,6 +747,14 @@ def _baseline_ratio(joueur_id: UUID, type_seance_id, conn, recence_j: int) -> tu
                   AND s.date >= CURRENT_DATE - INTERVAL '{recence_j} days'
                   AND dg.duree_minutes > 0
                   AND dg.distance_totale_m > 0
+                  -- Séances où le joueur a été volontairement ménagé : exclues de sa norme
+                  -- (même règle que la distance attendue du rapport de séance).
+                  AND NOT EXISTS (
+                      SELECT 1 FROM presence pr
+                      WHERE pr.seance_id = s.id
+                        AND pr.joueur_id = dg.joueur_id
+                        AND pr.statut = 'ADAPTE'
+                  )
                 ORDER BY s.date DESC
                 LIMIT 10
             ) sub
@@ -1965,7 +1973,11 @@ def get_charge_collective(semaines: int = 4,
 
 
 @router.get("/seance/{seance_id}/rapport")
-def get_rapport_seance(seance_id: UUID):
+def get_rapport_seance(seance_id: UUID, x_date_simulee: str | None = Header(default=None)):
+    # La date du jour décide si la séance a eu lieu (cf. `seance_passee` plus bas) : elle doit
+    # suivre l'horloge simulée, sinon un test à une date passée verrait toutes ses séances
+    # « futures » et le rapport se viderait.
+    date_ref = _parse_date_simulee(x_date_simulee) or _date.today()
     try:
         with get_connection() as conn:
             cfg = _load_config(conn)
@@ -2012,16 +2024,54 @@ def get_rapport_seance(seance_id: UUID):
             duree_type      = float(seance[10]) if seance[10] else None
             duree_reference = duree_planifiee or duree_deroule or duree_type
 
+            # Le rapport part de QUI A FAIT LA SÉANCE, pas de qui portait un capteur.
+            # Auparavant la liste sortait de `donnee_gps` : un joueur présent à l'appel mais non
+            # équipé disparaissait purement et simplement du rapport, même s'il avait rempli son
+            # RPE. Le moteur, lui, savait déjà compter sa charge (repli GPS↔sRPE) — le trou était
+            # uniquement d'affichage.
+            # Une séance qui N'A PAS ENCORE EU LIEU n'a pas de participants. L'appel se fait par
+            # exception (aucune ligne en base = présent), donc sur une séance future le COALESCE
+            # ci-dessous renverrait TOUT L'EFFECTIF en « présent sans capteur » : un tableau plein
+            # de joueurs et de zéros, qui se lit comme une panne. On se limite alors aux porteurs
+            # de données réelles — il peut y en avoir (import anticipé, RPE saisi d'avance), et
+            # une donnée mesurée ne disparaît jamais.
+            seance_passee = seance_date is not None and seance_date <= date_ref
+            branche_effectif = """
+                        UNION
+                        -- …plus l'effectif que l'appel dit présent. Un statut non participant
+                        -- (absent, excusé, au soin) sort de la liste — sauf s'il a des données GPS,
+                        -- auquel cas la branche du dessus le rattrape : c'est une CONTRADICTION à
+                        -- montrer, pas à masquer (erreur d'appel ou mauvais appariement de nom).
+                        SELECT es.joueur_id
+                        FROM effectif_saison es
+                        JOIN saison sa ON sa.id = es.saison_id AND sa.statut = 'EN_COURS'
+                        LEFT JOIN presence pr ON pr.seance_id = %s AND pr.joueur_id = es.joueur_id
+                        WHERE es.equipe_id = (SELECT equipe_id FROM seance WHERE id = %s)
+                          AND COALESCE(pr.statut, 'PRESENT') NOT IN ('ABSENT', 'EXCUSE', 'SOIN')
+            """ if seance_passee else ""
+            # 3 %s dans la branche effectif (présence, séance) + 1 en tête + 3 dans les jointures.
+            nb_params = 6 if seance_passee else 4
+
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
+                    WITH participants AS (
+                        -- Tout joueur porteur de données sur la séance, même hors effectif : on ne
+                        -- fait jamais disparaître une donnée mesurée.
+                        SELECT dg.joueur_id AS jid FROM donnee_gps dg WHERE dg.seance_id = %s
+                        {branche_effectif}
+                    )
                     SELECT j.id, j.nom, j.prenom, j.poste_principal,
                            dg.distance_totale_m, dg.duree_minutes,
-                           dg.vitesse_max_kmh, dg.nb_sprints_24kmh
-                    FROM donnee_gps dg
-                    JOIN joueur j ON j.id = dg.joueur_id
-                    WHERE dg.seance_id = %s
+                           dg.vitesse_max_kmh, dg.nb_sprints_24kmh,
+                           COALESCE(pr.statut, 'PRESENT') AS statut_appel,
+                           r.charge, r.rpe
+                    FROM participants p
+                    JOIN joueur j ON j.id = p.jid
+                    LEFT JOIN presence  pr ON pr.seance_id = %s AND pr.joueur_id = j.id
+                    LEFT JOIN donnee_gps dg ON dg.seance_id = %s AND dg.joueur_id = j.id
+                    LEFT JOIN rpe_seance r  ON r.seance_id  = %s AND r.joueur_id  = j.id
                     ORDER BY j.nom, j.prenom
-                """, (str(seance_id),))
+                """, (str(seance_id),) * nb_params)
                 players = cur.fetchall()
 
             # Dernier repli : sans déroulé ni durée planifiée (séance-coquille GPS ou match),
@@ -2066,6 +2116,15 @@ def get_rapport_seance(seance_id: UUID):
                                   AND s.date >= %s::date - INTERVAL '{recence_j} days'
                                   AND dg.duree_minutes > 0
                                   AND dg.distance_totale_m > 0
+                                  -- Une séance où le joueur a été VOLONTAIREMENT ménagé ne peut pas
+                                  -- servir de norme : elle abaisserait sa baseline, et son premier
+                                  -- retour à la normale ressortirait ensuite en surcharge.
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM presence pr
+                                      WHERE pr.seance_id = s.id
+                                        AND pr.joueur_id = dg.joueur_id
+                                        AND pr.statut = 'ADAPTE'
+                                  )
                                 ORDER BY s.date DESC
                                 LIMIT 10
                             ) sub
@@ -2139,6 +2198,15 @@ def get_rapport_seance(seance_id: UUID):
                     "atteint_objectif":        atteint_objectif,
                     "objectif_seance_m":       objectif_seance_m,
                     "atteint_objectif_seance": atteint_objectif_seance,
+                    # Contexte d'appel : de quoi expliquer une ligne sans kilomètres au lieu de la
+                    # faire disparaître. `sans_capteur` = présent mais aucune donnée GPS.
+                    # `contradiction` = déclaré non participant ALORS QU'il a des données : à
+                    # vérifier (erreur d'appel, ou mauvais rattachement de nom à l'import).
+                    "statut_appel":            p[8],
+                    "sans_capteur":            p[4] is None,
+                    "contradiction":           p[8] in ('ABSENT', 'EXCUSE', 'SOIN') and p[4] is not None,
+                    "charge_rpe":              float(p[9]) if p[9] is not None else None,
+                    "intensite_rpe":           int(p[10]) if p[10] is not None else None,
                 })
 
         return {
@@ -2147,6 +2215,13 @@ def get_rapport_seance(seance_id: UUID):
             "type_code":    type_code,
             "type_libelle": seance[3],
             "nb_joueurs":   len(lignes),
+            # `nb_joueurs` = participants (appel), `nb_porteurs` = lignes réellement mesurées.
+            # Toute moyenne GPS doit se diviser par nb_porteurs : depuis que les présents sans
+            # capteur figurent dans la liste, diviser par nb_joueurs ferait chuter les moyennes
+            # d'équipe sans qu'aucun joueur n'ait moins couru.
+            "nb_porteurs":  sum(1 for l in lignes if not l["sans_capteur"]),
+            "nb_sans_capteur":  sum(1 for l in lignes if l["sans_capteur"]),
+            "nb_contradictions": sum(1 for l in lignes if l["contradiction"]),
             # Objectif d'équipe de la séance (cible prépa, tous types)
             "objectif":                            objectif_texte,
             "objectif_distance_m":                 objectif_distance_m,
@@ -2523,97 +2598,176 @@ def post_simulation_seance(requete: SimulationSeanceRequete,
 
 @router.get("/equipe/derives")
 def get_derives(x_contexte_equipes: str | None = Header(default=None),
-                x_contexte_club: str | None = Header(default=None)):
+                x_contexte_club: str | None = Header(default=None),
+                x_date_simulee: str | None = Header(default=None)):
     """
     Dérives lentes de l'effectif sur ~4 semaines, en TROIS axes séparés (pour une lecture globale
-    de chacun) : volume (distance totale), charge haute intensité (distance ≥ 19 km/h) et ressenti
-    (fatigue subjective composite). Par axe et par joueur : comparaison de la moyenne des 14 derniers
+    de chacun) : volume (distance totale), intensité (PART du volume courue au-dessus de 19 km/h)
+    et ressenti (fatigue subjective composite). Par axe et par joueur : comparaison des 14 derniers
     jours vs les 14 précédents → dérive en hausse / en baisse au-delà d'un seuil. Indicateurs déjà
     agrégés (jamais de données brutes au LLM), consommés par la carte web/PWA et le debrief textuel.
+
+    ⚠ Ce n'est PAS un ratio de charge (cf. ACWR) et les deux ne se remplacent pas : l'ACWR compare
+    un joueur à SON passé proche pour dire « trop / pas assez », avec des seuils physiologiques ;
+    la dérive dit dans quel SENS l'effectif se déplace, sans seuil de danger. L'ACWR est aveugle à
+    une montée lente (la charge chronique suit l'aiguë, le ratio ne bouge pas), la dérive est
+    aveugle à un pic isolé (dilué dans une fenêtre de 14 jours).
+
+    L'axe intensité raisonne en PART du volume : en mètres bruts il ne faisait que répéter l'axe
+    volume (quand le volume monte, les mètres à haute intensité montent mécaniquement avec lui).
+    En part, il répond à une question distincte — « le contenu devient-il plus intense ? ».
+
+    GARDE-FOUS de quantité de données : un joueur n'est comparé que s'il a assez de séances DANS
+    CHAQUE fenêtre et une référence au-dessus d'un plancher absolu. Sans eux, un retour de blessure
+    (1 séance de reprise en référence, ~120 m à haute intensité) produisait des dérives à +1900 %
+    qui ne disaient rien d'autre qu'un dénominateur minuscule. Les joueurs écartés sont COMPTÉS
+    (`nb_ecartes`), jamais masqués en silence — le reste du moteur signale déjà ses estimations
+    provisoires, ce bloc était le seul sans aucun garde-fou.
     """
-    SEUIL = 20.0   # % de variation à partir duquel on parle de dérive
     try:
         with get_connection() as conn:
+            cfg = _load_config(conn)
+            seuil        = float(cfg.get("derive_seuil_pct", 20.0))
+            min_seances  = int(cfg.get("derive_min_seances", 3))
+            min_jours    = int(cfg.get("derive_min_jours_ressenti", 3))
+            plancher_vol = float(cfg.get("derive_plancher_volume_m", 3000.0))
+            plancher_hi  = float(cfg.get("derive_plancher_hi_m", 300.0))
+
+            # Fenêtres bornées par la date de RÉFÉRENCE (date simulée honorée, comme le risque) :
+            # ]debut, milieu[ = référence, [milieu, date_ref] = récent.
+            date_ref = _parse_date_simulee(x_date_simulee) or _date.today()
+            debut    = date_ref - _timedelta(days=28)
+            milieu   = date_ref - _timedelta(days=14)
+
             scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
             roster = _joueurs_resume(conn, scope)
             noms = {str(jid): f'{(prenom or "").strip()} {(nom or "").strip()}'.strip()
                     for (jid, nom, prenom, poste) in roster}
             ids = list(noms.keys())
 
-            gps = {}   # jid -> (vol_recent, vol_ref, hi_recent, hi_ref)
-            well = {}  # jid -> (w_recent, w_ref)  (composite, haut = plus de fatigue)
+            gps = {}   # jid -> (vol_recent, vol_ref, hi_recent, hi_ref, n_recent, n_ref)
+            well = {}  # jid -> (w_recent, w_ref, n_recent, n_ref)  (composite, haut = + de fatigue)
             if ids:
-                gwhere = ["s.statut = 'REALISEE'", "s.date >= CURRENT_DATE - INTERVAL '28 days'",
+                gwhere = ["s.statut = 'REALISEE'", "s.date >= %s", "s.date <= %s",
                           "dg.joueur_id = ANY(%s)"]
-                gparams: list = [ids]
+                gparams: list = [debut, date_ref, ids]
                 if scope:
                     gwhere.append("s.equipe_id = ANY(%s)"); gparams.append(scope)
                 with conn.cursor() as cur:
+                    # Les deux COUNT(DISTINCT …) sont le garde-fou : sans le nombre de séances de
+                    # chaque fenêtre, impossible de distinguer une vraie dérive d'un effectif de
+                    # comparaison ridicule.
                     cur.execute(f"""
                         SELECT dg.joueur_id,
-                          SUM(CASE WHEN s.date >= CURRENT_DATE - INTERVAL '14 days' THEN dg.distance_totale_m ELSE 0 END),
-                          SUM(CASE WHEN s.date <  CURRENT_DATE - INTERVAL '14 days' THEN dg.distance_totale_m ELSE 0 END),
-                          SUM(CASE WHEN s.date >= CURRENT_DATE - INTERVAL '14 days' THEN COALESCE(dg.distance_19kmh_m,0) ELSE 0 END),
-                          SUM(CASE WHEN s.date <  CURRENT_DATE - INTERVAL '14 days' THEN COALESCE(dg.distance_19kmh_m,0) ELSE 0 END)
+                          SUM(CASE WHEN s.date >= %s THEN dg.distance_totale_m ELSE 0 END),
+                          SUM(CASE WHEN s.date <  %s THEN dg.distance_totale_m ELSE 0 END),
+                          SUM(CASE WHEN s.date >= %s THEN COALESCE(dg.distance_19kmh_m,0) ELSE 0 END),
+                          SUM(CASE WHEN s.date <  %s THEN COALESCE(dg.distance_19kmh_m,0) ELSE 0 END),
+                          COUNT(DISTINCT CASE WHEN s.date >= %s THEN s.id END),
+                          COUNT(DISTINCT CASE WHEN s.date <  %s THEN s.id END)
                         FROM donnee_gps dg JOIN seance s ON s.id = dg.seance_id
                         WHERE {' AND '.join(gwhere)}
                         GROUP BY dg.joueur_id
-                    """, gparams)
-                    for jid, vr, vf, hr, hf in cur.fetchall():
-                        gps[str(jid)] = (float(vr or 0), float(vf or 0), float(hr or 0), float(hf or 0))
+                    """, [milieu] * 6 + gparams)
+                    for jid, vr, vf, hr, hf, nr, nf in cur.fetchall():
+                        gps[str(jid)] = (float(vr or 0), float(vf or 0),
+                                         float(hr or 0), float(hf or 0),
+                                         int(nr or 0), int(nf or 0))
                 with conn.cursor() as cur:
                     cur.execute("""
                         SELECT joueur_id,
-                          AVG(CASE WHEN date >= CURRENT_DATE - INTERVAL '14 days' THEN comp END),
-                          AVG(CASE WHEN date <  CURRENT_DATE - INTERVAL '14 days' THEN comp END)
+                          AVG(CASE WHEN date >= %s THEN comp END),
+                          AVG(CASE WHEN date <  %s THEN comp END),
+                          COUNT(CASE WHEN date >= %s THEN 1 END),
+                          COUNT(CASE WHEN date <  %s THEN 1 END)
                         FROM (
                           SELECT joueur_id, date,
                                  ((11-sommeil)+(11-humeur)+(11-fatigue)+(11-douleur)+(11-stress))/5.0*10 AS comp
                           FROM wellness_quotidien
-                          WHERE date >= CURRENT_DATE - INTERVAL '28 days' AND joueur_id = ANY(%s)
+                          WHERE date >= %s AND date <= %s AND joueur_id = ANY(%s)
                         ) w
                         GROUP BY joueur_id
-                    """, (ids,))
-                    for jid, wr, wf in cur.fetchall():
+                    """, (milieu, milieu, milieu, milieu, debut, date_ref, ids))
+                    for jid, wr, wf, nr, nf in cur.fetchall():
                         well[str(jid)] = (float(wr) if wr is not None else None,
-                                          float(wf) if wf is not None else None)
+                                          float(wf) if wf is not None else None,
+                                          int(nr or 0), int(nf or 0))
 
-        def _drift(recent, ref):
-            """(direction, pct) si dérive au-delà du seuil, sinon None. ref insuffisant → None."""
+        def _drift(recent, ref, n_recent, n_ref, min_n, plancher):
+            """
+            (direction, pct, recent, ref) si la comparaison est FIABLE, sinon None.
+            None = « données insuffisantes » : pas assez de séances (ou de jours) dans une des deux
+            fenêtres, ou référence sous le plancher absolu. C'est volontairement distinct de
+            « stable » — l'appelant compte les deux séparément.
+            """
             if recent is None or ref is None or ref <= 0:
                 return None
+            if n_recent < min_n or n_ref < min_n:
+                return None
+            if plancher is not None and ref < plancher:
+                return None
             pct = round((recent - ref) / ref * 100, 1)
-            if pct >= SEUIL:  return ("hausse", pct)
-            if pct <= -SEUIL: return ("baisse", pct)
-            return ("stable", pct)
+            if pct >= seuil:  return ("hausse", pct, recent, ref)
+            if pct <= -seuil: return ("baisse", pct, recent, ref)
+            return ("stable", pct, recent, ref)
 
-        def _axe(code, libelle, sens_hausse, valeur):
-            hausse, baisse = [], []
+        def _axe(code, libelle, sens_hausse, unite, valeur):
+            hausse, baisse, ecartes = [], [], 0
             for jid in ids:
                 d = _drift(*valeur(jid))
-                if d is None or d[0] == "stable":
+                if d is None:
+                    ecartes += 1          # écarté faute de données — surtout pas « stable »
                     continue
-                ligne = {"joueur_id": jid, "nom": noms.get(jid, "joueur"), "drift_pct": d[1]}
+                if d[0] == "stable":
+                    continue
+                # valeur_recente / valeur_reference : de quoi montrer la composition dans la carte
+                # (« 6,1 % → 7,9 % »), un pourcentage seul n'est pas interprétable.
+                ligne = {"joueur_id": jid, "nom": noms.get(jid, "joueur"), "drift_pct": d[1],
+                         "valeur_recente": round(d[2], 1), "valeur_reference": round(d[3], 1)}
                 (hausse if d[0] == "hausse" else baisse).append(ligne)
             hausse.sort(key=lambda x: x["drift_pct"], reverse=True)
             baisse.sort(key=lambda x: x["drift_pct"])
             return {
-                "code": code, "libelle": libelle, "sens_hausse": sens_hausse,
-                "nb_hausse": len(hausse), "nb_baisse": len(baisse),
+                "code": code, "libelle": libelle, "sens_hausse": sens_hausse, "unite": unite,
+                "nb_hausse": len(hausse), "nb_baisse": len(baisse), "nb_ecartes": ecartes,
                 "hausse": hausse[:5], "baisse": baisse[:5],
             }
 
+        def _g(jid):
+            return gps.get(jid, (0.0, 0.0, 0.0, 0.0, 0, 0))
+
+        def _volume(jid):
+            v_r, v_f, _h_r, _h_f, n_r, n_f = _g(jid)
+            return (v_r / 1000, v_f / 1000, n_r, n_f, min_seances, plancher_vol / 1000)
+
+        def _part_hi(jid):
+            """
+            Part du volume courue au-dessus de 19 km/h (%). Insensible au nombre de séances : un
+            calendrier plus dense ne la fait pas bouger, seul le CONTENU la fait bouger. Sans
+            volume ni mètres de haute intensité de référence suffisants, la part n'a pas de sens.
+            """
+            v_r, v_f, h_r, h_f, n_r, n_f = _g(jid)
+            if v_r <= 0 or v_f < plancher_vol or h_f < plancher_hi:
+                return (None, None, n_r, n_f, min_seances, None)
+            return (h_r / v_r * 100, h_f / v_f * 100, n_r, n_f, min_seances, None)
+
+        def _ressenti(jid):
+            w_r, w_f, n_r, n_f = well.get(jid, (None, None, 0, 0))
+            # Échelle bornée 0-100 : pas de plancher à poser, mais une moyenne sur 1 jour reste
+            # du bruit — d'où un minimum de JOURS de saisie dans chaque fenêtre.
+            return (w_r, w_f, n_r, n_f, min_jours, None)
+
         axes = [
-            _axe("volume", "Volume (distance totale)", "charge en hausse",
-                 lambda jid: (gps.get(jid, (0, 0, 0, 0))[0], gps.get(jid, (0, 0, 0, 0))[1])),
-            _axe("intensite", "Haute intensité (≥ 19 km/h)", "sollicitation intense en hausse",
-                 lambda jid: (gps.get(jid, (0, 0, 0, 0))[2], gps.get(jid, (0, 0, 0, 0))[3])),
-            _axe("wellness", "Ressenti (fatigue subjective)", "fatigue en hausse",
-                 lambda jid: well.get(jid, (None, None))),
+            _axe("volume", "Volume (distance totale)", "charge en hausse", "km", _volume),
+            _axe("intensite", "Intensité (part du volume ≥ 19 km/h)",
+                 "contenu plus intense à volume égal", "%", _part_hi),
+            _axe("wellness", "Ressenti (fatigue subjective)", "fatigue en hausse", "/100", _ressenti),
         ]
         return {
             "fenetre_jours": 28,
-            "seuil_pct": SEUIL,
+            "seuil_pct": seuil,
+            "min_seances": min_seances,
+            "date_reference": str(date_ref),
             "effectif": {"nb_joueurs": len(ids)},
             "axes": axes,
         }
