@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
+from datetime import date as _date, timedelta as _timedelta
 
 from . import config
 from .config import DEFAUT, ENVIRONNEMENTS
@@ -35,6 +36,10 @@ def _args():
     p.add_argument("--env", choices=list(ENVIRONNEMENTS), default="local")
     p.add_argument("--seed", type=int, default=DEFAUT.seed)
     p.add_argument("--semaines", type=int, default=DEFAUT.nb_semaines)
+    p.add_argument("--debut-saison", metavar="AAAA-MM-JJ",
+                   help=f"1er lundi de pré-saison (défaut {DEFAUT.debut_saison.isoformat()}). "
+                        "Doit tomber DANS la saison EN_COURS du club, sinon les données "
+                        "atterrissent hors de la saison qui est censée les contenir.")
     p.add_argument("--admin-email", help=f"super-admin pilote (sinon ${config.ADMIN_EMAIL_ENV})")
     p.add_argument("--admin-password", help=f"mot de passe super-admin (sinon ${config.ADMIN_PASSWORD_ENV})")
     p.add_argument("--confirm", action="store_true", help="obligatoire pour --env prod")
@@ -48,6 +53,21 @@ def _garde_fous(a):
         sys.exit("✗ --env prod exige --confirm (écriture sur la PROD, confinée aux clubs de démo).")
 
 
+def _debut_saison(valeur):
+    """Parse `--debut-saison` et exige un LUNDI : tout le calendrier est bâti en microcycles."""
+    if not valeur:
+        return DEFAUT.debut_saison
+    try:
+        d = _date.fromisoformat(valeur)
+    except ValueError:
+        sys.exit(f"✗ --debut-saison « {valeur} » n'est pas une date AAAA-MM-JJ.")
+    if d.weekday() != 0:
+        lundi = d - _timedelta(days=d.weekday())
+        sys.exit(f"✗ --debut-saison doit être un LUNDI (les semaines sont des microcycles). "
+                 f"Le lundi de cette semaine-là est {lundi.isoformat()}.")
+    return d
+
+
 def main():
     # Console Windows : éviter les plantages d'encodage sur les symboles (✓, →…).
     for flux in (sys.stdout, sys.stderr):
@@ -58,7 +78,8 @@ def main():
 
     a = _args()
     _garde_fous(a)
-    params = dataclasses.replace(DEFAUT, seed=a.seed, nb_semaines=a.semaines)
+    params = dataclasses.replace(DEFAUT, seed=a.seed, nb_semaines=a.semaines,
+                                 debut_saison=_debut_saison(a.debut_saison))
 
     # ── Aperçu : simulation seule, un échantillon par niveau (aucune connexion) ──
     if a.apercu:

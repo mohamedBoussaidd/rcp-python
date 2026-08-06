@@ -206,7 +206,8 @@ def charge_equipe(debut: str | None = None, fin: str | None = None, types: str |
 
 def briefing(x_contexte_equipes: str | None = None,
              x_contexte_club: str | None = None,
-             x_date_simulee: str | None = None):
+             x_date_simulee: str | None = None,
+             x_module_objectifs: str | None = None):
     """
     Bundle d'INDICATEURS COMPACTS pour la carte « briefing » du préparateur.
     N'est JAMAIS envoyé tel quel au front : consommé par le back Java qui le met en mots (LLM) ou
@@ -218,7 +219,8 @@ def briefing(x_contexte_equipes: str | None = None,
         with get_connection() as conn:
             cfg   = _load_config(conn)
             scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
-            oh    = _objectif_hebdo_data(conn, cfg, scope, _parse_date_simulee(x_date_simulee))
+            oh    = _objectif_hebdo_data(conn, cfg, scope, _parse_date_simulee(x_date_simulee),
+                                         x_module_objectifs == "1")
 
         joueurs = oh["joueurs"]
 

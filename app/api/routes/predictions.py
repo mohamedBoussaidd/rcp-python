@@ -19,6 +19,7 @@ from app.domain.contexte import _contexte_joueur
 from app.domain.risque import _risque_probabiliste
 from app.domain.fatigue import _calcul_fatigue
 from app.domain.objectif import _charge_cible, _simulation_seance_data, _objectif_hebdo_data
+from app.domain.objectif_suivi import trajectoire_joueur, bilan_periode
 from app.domain.rapport_seance import rapport_seance
 from app.domain.derives import derives
 from app.domain.equipe import charge_equipe, briefing, resume_equipe
@@ -218,8 +219,9 @@ def get_charge_equipe(debut: str | None = None, fin: str | None = None, types: s
 @router.get("/equipe/briefing")
 def get_briefing(x_contexte_equipes: str | None = Header(default=None),
                  x_contexte_club: str | None = Header(default=None),
-                 x_date_simulee: str | None = Header(default=None)):
-    return briefing(x_contexte_equipes, x_contexte_club, x_date_simulee)
+                 x_date_simulee: str | None = Header(default=None),
+                 x_module_objectifs: str | None = Header(default=None)):
+    return briefing(x_contexte_equipes, x_contexte_club, x_date_simulee, x_module_objectifs)
 
 
 @router.get("/equipe", response_model=List[ResumeJoueur])
@@ -232,18 +234,66 @@ def get_resume_equipe(x_date_simulee: str | None = Header(default=None),
 @router.get("/equipe/objectif-hebdo")
 def get_objectif_hebdo(x_contexte_equipes: str | None = Header(default=None),
                        x_contexte_club: str | None = Header(default=None),
-                       x_date_simulee: str | None = Header(default=None)):
+                       x_date_simulee: str | None = Header(default=None),
+                       x_module_objectifs: str | None = Header(default=None)):
     """
     Panneau « Objectif de la semaine » (semaine ISO en cours, lundi → aujourd'hui).
     Par joueur de l'effectif : cumul de distance de la semaine, cible A.5 (« suggestion
     intelligente »), objectif retenu (manuel d'équipe si défini, sinon la cible A.5) et atteinte.
     L'objectif manuel n'est lu que si le contexte cible UNE seule équipe.
+
+    X-Module-Objectifs = « 1 » quand le club a l'add-on « Objectifs de performance » (tranché par
+    Java, seul à connaître l'abonnement) : il ouvre le niveau attendu du poste, les objectifs
+    prescrits de la période et le plafonnement ACWR. Absent → panneau d'origine.
     """
     try:
         with get_connection() as conn:
             cfg   = _load_config(conn)
             scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
-            return _objectif_hebdo_data(conn, cfg, scope, _parse_date_simulee(x_date_simulee))
+            return _objectif_hebdo_data(conn, cfg, scope, _parse_date_simulee(x_date_simulee),
+                                        x_module_objectifs == "1")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/joueur/{joueur_id}/objectif-trajectoire")
+def get_objectif_trajectoire(joueur_id: str,
+                             periode_id: str | None = None,
+                             x_contexte_equipes: str | None = Header(default=None),
+                             x_contexte_club: str | None = Header(default=None),
+                             x_date_simulee: str | None = Header(default=None),
+                             x_module_objectifs: str | None = Header(default=None)):
+    """
+    Onglet « Objectif de charge » de la fiche joueur : Habituel / Attendu / Retenu semaine par
+    semaine sur la période, plus le réalisé. `periode_id` absent → la période qui couvre la date
+    du jour (ou la date simulée).
+    """
+    try:
+        with get_connection() as conn:
+            scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
+            return trajectoire_joueur(conn, joueur_id, periode_id, scope,
+                                      _parse_date_simulee(x_date_simulee),
+                                      x_module_objectifs == "1")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/equipe/bilan-periode")
+def get_bilan_periode(periode_id: str,
+                      x_contexte_equipes: str | None = Header(default=None),
+                      x_contexte_club: str | None = Header(default=None),
+                      x_date_simulee: str | None = Header(default=None),
+                      x_module_objectifs: str | None = Header(default=None)):
+    """
+    Bilan d'une période : prescrit contre réalisé, par métrique et par semaine, plus les joueurs
+    les plus en écart. Recalculé à chaque appel — un import GPS tardif corrige le bilan.
+    """
+    try:
+        with get_connection() as conn:
+            scope = _equipes_scope(x_contexte_equipes, x_contexte_club, conn)
+            return bilan_periode(conn, periode_id, scope,
+                                 _parse_date_simulee(x_date_simulee),
+                                 x_module_objectifs == "1")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

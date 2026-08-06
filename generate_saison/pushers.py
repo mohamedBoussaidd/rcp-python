@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from .api_client import ApiError
 from .bootstrap import BootstrapContext
 from .simulation import SaisonSimulee
 
@@ -127,7 +128,9 @@ def pousser_gps(ctx: BootstrapContext, saison: SaisonSimulee) -> int:
             "nbFreinages": m.nb_freinages,
             "ratioDistanceMin": m.ratio_distance_min,
         } for m in mesures]
-        prepa.post("/api/import/excel/confirmer",
+        # `/api/import/confirmer` : le contrôleur a perdu son segment « excel » à la restructuration
+        # feature-first (le format n'a jamais été lié à Excel — le corps est du JSON pur).
+        prepa.post("/api/import/confirmer",
                    json={"seanceId": seance_id, "resolutions": [], "lignes": lignes})
         total += len(lignes)
     return total
@@ -256,11 +259,21 @@ def pousser_plan_de_jeu(ctx: BootstrapContext) -> int:
 def pousser_matchs(ctx: BootstrapContext, saison: SaisonSimulee) -> int:
     coach = ctx.worker("matchs")
     rng = np.random.default_rng(saison.params.seed + 11)
+    # Depuis V104, poser une séance de type MATCH crée DÉJÀ son dossier de match. En reposter un
+    # ici créerait une seconde séance (le back en crée une pour tout match qui n'en a pas) : on
+    # récupère donc le dossier existant à la même date et on se contente de le compléter.
+    existants = {}
+    try:
+        for m in coach.get("/api/matchs") or []:
+            if m.get("dateMatch"):
+                existants.setdefault(m["dateMatch"], m)
+    except ApiError:
+        pass   # module Match absent de ce pack : on retombe sur la création, qui échouera proprement
     n = 0
     for s in saison.seances:
         if not s.est_match:
             continue
-        cree = coach.post("/api/matchs", json={
+        cree = existants.get(s.date.isoformat()) or coach.post("/api/matchs", json={
             "adversaire": s.adversaire,
             "dateMatch": s.date.isoformat(),
             "competition": "Championnat",
@@ -272,8 +285,120 @@ def pousser_matchs(ctx: BootstrapContext, saison: SaisonSimulee) -> int:
             "resultat": resultat, "score": f"{bf}-{ba}",
             "notesDebrief": "Débrief simulé : analyse des phases clés et axes de travail.",
         })
+        # Compo puis feuille de match : sans elles l'onglet Compétition reste vide, et le temps
+        # de jeu n'a qu'une seule source (le GPS) au lieu des trois qu'il sait afficher.
+        _pousser_compo_et_feuille(coach, ctx, cree["id"], bf, rng)
         n += 1
     return n
+
+
+# 4-3-3 : un titulaire par ligne du terrain, puis les remplaçants. Le rabattement suit les postes
+# réels de l'effectif simulé — une compo tirée au hasard produirait 4 gardiens et aucun défenseur.
+_LIGNES_433 = [
+    (["GK"], 1, [(50, 92)]),
+    (["LB", "DC", "DC", "RB"], 4, [(18, 72), (38, 76), (62, 76), (82, 72)]),
+    (["MDC", "MC", "MC"], 3, [(32, 52), (50, 56), (68, 52)]),
+    (["AG", "ATT", "AD"], 3, [(20, 28), (50, 22), (80, 28)]),
+]
+
+
+def _pousser_compo_et_feuille(coach, ctx: BootstrapContext, match_id: str,
+                              buts_pour: int, rng) -> None:
+    """Compo (11 titulaires + remplaçants) et feuille de match cohérente avec le score."""
+    dispos = [j for j in ctx.effectif if j.backend_id]
+    if len(dispos) < 11:
+        return
+
+    restants = list(dispos)
+    titulaires: list = []
+    placements: list = []
+    for postes, nb, coords in _LIGNES_433:
+        for i in range(nb):
+            poste = postes[i] if i < len(postes) else postes[-1]
+            choix = next((j for j in restants if j.poste == poste), None)
+            if choix is None:                      # effectif incomplet à ce poste : on prend au champ
+                choix = next((j for j in restants if j.poste != "GK"), None)
+            if choix is None:
+                continue
+            restants.remove(choix)
+            titulaires.append(choix)
+            x, y = coords[i]
+            placements.append({"joueurId": choix.backend_id, "x": x, "y": y,
+                               "statut": "TITULAIRE", "consigne": None})
+
+    remplacants = restants[:7]
+    for r in remplacants:
+        placements.append({"joueurId": r.backend_id, "x": 0, "y": 0,
+                           "statut": "REMPLACANT", "consigne": None})
+
+    try:
+        coach.put(f"/api/matchs/{match_id}/compo", json={"placements": placements})
+    except Exception:
+        return   # module tactique absent sur ce tier : on n'interrompt jamais le run
+
+    # ── Feuille : qui a joué, combien de temps, et ce qu'il y a fait ──
+    entrants = list(rng.choice(len(remplacants), size=min(3, len(remplacants)), replace=False)) \
+        if remplacants else []
+    sortants = list(rng.choice(11, size=len(entrants), replace=False)) if entrants else []
+
+    lignes = []
+    for i, j in enumerate(titulaires):
+        sort = i in sortants
+        minute_sortie = int(rng.integers(55, 85)) if sort else 90
+        lignes.append({
+            "joueurId": j.backend_id, "entreEnJeu": True,
+            "minuteEntree": 0, "minuteSortie": minute_sortie,
+            "buts": 0, "passesDecisives": 0, "cartonsJaunes": 0, "cartonRouge": False,
+        })
+    for rang, idx in enumerate(entrants):
+        j = remplacants[int(idx)]
+        # Il entre quand un titulaire sort : les minutes des deux côtés restent cohérentes.
+        minute = lignes[int(sortants[rang])]["minuteSortie"]
+        lignes.append({
+            "joueurId": j.backend_id, "entreEnJeu": True,
+            "minuteEntree": minute, "minuteSortie": 90,
+            "buts": 0, "passesDecisives": 0, "cartonsJaunes": 0, "cartonRouge": False,
+        })
+    for rang, r in enumerate(remplacants):
+        if rang in [int(i) for i in entrants]:
+            continue
+        lignes.append({
+            "joueurId": r.backend_id, "entreEnJeu": False,
+            "minuteEntree": None, "minuteSortie": None,
+            "buts": 0, "passesDecisives": 0, "cartonsJaunes": 0, "cartonRouge": False,
+        })
+
+    # Les buts du score se répartissent sur ceux qui étaient sur le terrain, offensifs d'abord —
+    # sinon la feuille annoncerait 3-1 avec zéro buteur, et l'onglet Compétition serait incohérent.
+    joueurs_en_jeu = [k for k, l in enumerate(lignes) if l["entreEnJeu"]]
+    offensifs = [k for k in joueurs_en_jeu
+                 if _poste_de(ctx, lignes[k]["joueurId"]) in ("ATT", "AG", "AD", "MC")]
+    cible = offensifs or joueurs_en_jeu
+    for _ in range(buts_pour):
+        k = int(rng.choice(cible))
+        lignes[k]["buts"] += 1
+        passeurs = [p for p in joueurs_en_jeu if p != k]
+        if passeurs and rng.random() < 0.7:
+            lignes[int(rng.choice(passeurs))]["passesDecisives"] += 1
+
+    # ~2,5 jaunes par match, rouge rare — et jamais un rouge sans les deux jaunes qui l'imposent.
+    for _ in range(int(rng.integers(1, 4))):
+        k = int(rng.choice(joueurs_en_jeu))
+        lignes[k]["cartonsJaunes"] = min(2, lignes[k]["cartonsJaunes"] + 1)
+        if lignes[k]["cartonsJaunes"] == 2:
+            lignes[k]["cartonRouge"] = True
+
+    try:
+        coach.put(f"/api/matchs/{match_id}/feuille", json={"lignes": lignes})
+    except Exception:
+        pass   # module stats_competition absent : la compo reste, c'est déjà l'essentiel
+
+
+def _poste_de(ctx: BootstrapContext, backend_id: str) -> str:
+    for j in ctx.effectif:
+        if j.backend_id == backend_id:
+            return j.poste
+    return ""
 
 
 # ─────────────────────────── Formations & schémas tactiques ───────────────────────────
@@ -395,7 +520,7 @@ def pousser_tier(ctx: BootstrapContext, saison: SaisonSimulee, log=print) -> Non
     from .purge import nettoyer_episodiques
     p = ctx.profil
     log(f"→ [{p.nom} / {ctx.equipe_nom}] injection…")
-    nettoyer_episodiques(ctx, log)
+    nettoyer_episodiques(ctx, saison, log)
 
     ex = pousser_exercices(ctx) if p.tactique else {}
     log(f"  séances : {pousser_seances(ctx, saison, ex)} créées"
@@ -421,7 +546,7 @@ def pousser_tout(ctx: BootstrapContext, saison: SaisonSimulee, inclure_tactique:
     # conseils, matchs). Séances réutilisées par date → pas de doublons GPS/RPE.
     from .purge import nettoyer_episodiques
     log("→ Nettoyage des éléments non-idempotents…")
-    nettoyer_episodiques(ctx, log)
+    nettoyer_episodiques(ctx, saison, log)
     log("→ Exercices…")
     ex = pousser_exercices(ctx)
     log(f"  {len(ex)} exercices")
